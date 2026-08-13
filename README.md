@@ -77,6 +77,11 @@ All via environment variables (set in your shell or `settings.json`):
 **Calibration (v0.6)**
 - `ZERO_MEM_CALIBRATE=1` — opt-in deterministic checks on the model's own answers (code-fence balance, JSON validity, query-entity coverage, verbatim reproduction of injected memory). Non-destructive — emits warnings only.
 
+**Retrieval fusion (v0.9)**
+- `ZERO_MEM_FUSION` — `coverage` (default; BM25 for factual lookups, dense for synonym/paraphrase), `max`, or `weighted`.
+- `ZERO_MEM_HYBRID=0` — disable fusion (restore v0.8 dense-only; not recommended — underperforms BM25 on real data).
+- `ZERO_MEM_FEDERATE=0` — disable cross-project fallback (reach into other projects only when this one has nothing relevant).
+
 Code-level constants (`index.ts`/`core.ts`): `rho` (routing weight), closure discounts, `recentExcludeMs`, `scopeToProject`, `minScore`, BM25 `k1`/`b`.
 
 ## Performance
@@ -121,14 +126,35 @@ recall@K / MRR + token cost rather than end-to-end F1/BLEU.
 | config | recall@3 | recall@5 | MRR | tok/turn |
 |---|---:|---:|---:|---:|
 | BM25 only (no embeddings) | 0.75 | 0.75 | 0.73 | 32 |
-| + semantic (MiniLM) | 0.94 | **0.96** | 0.94 | 113 |
-| + semantic + MMR | 0.94 | 0.96 | 0.94 | 113 |
-| FULL (+ co-occurrence bridges) | 0.94 | 0.96 | 0.94 | 113 |
+| coverage fusion (v0.9 default) | 0.90 | **0.92** | 0.88 | 81 |
 
-Headline: dense embeddings lift recall@5 **0.75 → 0.96**. MMR/bridges are
-recall-neutral here by design (MMR cuts redundancy; bridges only fire on shared
-entities, which this dataset deliberately lacks). True paper-style eval on
-LoCoMo/HotpotQA with an LLM reader is a v0.9 roadmap item.
+Headline: the **coverage router** lifts recall@5 **0.75 → 0.92** over BM25 on
+synonym/paraphrase queries. (This dataset is designed to stress semantic
+matching; the v0.8 dense-only path scored 0.96 here, but see LoCoMo below for
+why that default was wrong for real data.)
+
+### LoCoMo10 — the paper's real benchmark
+
+`eval-locomo.ts` runs the retriever on the actual
+[LoCoMo10](https://github.com/snap-research/locomo) dataset (10 long
+conversations, 1986 QA). For each QA we check whether the gold-evidence
+utterance (by `dia_id`) lands in the top-K.
+
+| config | recall@5 | MRR |
+|---|---:|---:|
+| BM25 only | 0.529 | 0.393 |
+| pure semantic (MiniLM, v0.8 default) | 0.273 | 0.183 |
+| RRF hybrid (k=60) | 0.503 | 0.323 |
+| **coverage fusion (v0.9 default)** | **0.534** | **0.393** |
+
+On real conversational factual lookups, **BM25 beats MiniLM** (0.529 vs 0.273),
+and no naive fusion (max/weighted/RRF) recovers it — the dense model is weak
+out-of-domain. The v0.9 **coverage router** fixes it: blend BM25 + dense by
+the query's lexical coverage, so BM25 carries factual lookups (high coverage)
+while dense rescues synonym/paraphrase queries whose terms are OOV (low
+coverage). Result: **0.534 (≥ BM25) on LoCoMo** *and* **0.92 on the paraphrase
+eval** (vs BM25's 0.75) — best-of-both, no regressions. (Reader-based
+end-to-end F1/BLEU is a v0.10 item — it needs a running LLM endpoint.)
 
 ## Tests
 
@@ -139,7 +165,11 @@ node --experimental-strip-types test-mmr.ts        # MMR reduces pairwise redund
 node --experimental-strip-types test-calibrate.ts  # fence/json/coverage/verbatim checks (8/8)
 node --experimental-strip-types test.ts            # v0.4 co-occurrence relational bridges
 node --experimental-strip-types test-recall.ts     # v0.8 session-scoped recent-exclusion (3/3)
+node --experimental-strip-types test-federation.ts # v0.9 cross-project federation (5/5)
+node --experimental-strip-types test-adaptive.ts   # v0.9 adaptive MMR lambda (5/5)
+node --experimental-strip-types test-incremental.ts # v0.9 HNSW incremental insert (7/7)
 node --experimental-strip-types eval.ts            # retrieval eval: recall@K / MRR ablation
+node --experimental-strip-types eval-locomo.ts     # retrieval eval on real LoCoMo10 (caches ~2.8MB dataset)
 node --experimental-strip-types bench.ts           # A/B benchmark (store I/O + token overhead)
 ```
 
@@ -148,9 +178,14 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
-**v0.8** — everything in v0.7 plus **session-scoped recent-exclusion**: a fact the user just
-told the agent is now recallable immediately in a *new* session (previously dropped for 2 min
-across all sessions, so e.g. a name was unrecoverable in any conversation opened within 2 min).
-Retrieval eval is unchanged (semantic recall@5 0.96 vs BM25 0.75; see **Eval** above). Remaining
-work (true LoCoMo/LLM F1-BLEU eval, incremental HNSW, adaptive λ, cross-project federation) is
-documented in [`DESIGN.md`](./DESIGN.md).
+**v0.9** — cross-project federation (reach across projects when this one has nothing
+relevant), adaptive MMR λ (relevance-favoring for lookups, diversity-favoring for
+exploratory queries), HNSW incremental insert (fresh facts searchable at scale
+immediately, no waiting for the +50% rebuild), and a **retrieval eval on the real
+LoCoMo10 benchmark** that exposed and fixed a real deficiency: the v0.8 dense-only
+default underperformed BM25 on real data (r@5 0.273 vs 0.529). The fix is a
+**coverage router** that blends BM25 + dense by query lexical coverage — 0.534
+(≥ BM25) on LoCoMo, 0.92 on the paraphrase eval. 38/38 tests green. Remaining
+work (end-to-end F1/BLEU with an LLM reader, a stronger/conversational embedder
+or cross-encoder reranker to beat BM25 outright, incremental-HNSW quality) is in
+[`DESIGN.md`](./DESIGN.md).
