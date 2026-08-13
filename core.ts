@@ -37,6 +37,8 @@ export interface RetrieveOpts {
   useBridges?: boolean;        // v0.4: enable co-occurrence relational bridges (default true)
   useHnsw?: boolean;           // v0.6: HNSW ANN for semantic search at scale (default true; auto-gated by store.hnswThreshold)
   hnswEf?: number;             // v0.6: HNSW search ef (default 200 ~ recall 0.90 at dim 384; raise for more recall)
+  mmr?: boolean;               // v0.7: maximal-marginal-relevance diversity selection (default true)
+  mmrLambda?: number;          // v0.7: relevance vs diversity tradeoff, 0=relevance-only 1=diversity-only (default 0.5)
 }
 
 export interface Hit {
@@ -585,6 +587,36 @@ export class MemoryStore {
 }
 
 // ── Retrieval pipeline ──────────────────────────────────────────────────────
+// v0.7: pairwise similarity between two units for MMR — cosine of embeddings
+// (preferred) with a token-Jaccard fallback when embeddings are absent.
+function unitSim(a: TraceUnit, b: TraceUnit): number {
+  if (a.embedding && b.embedding && a.embedding.length === b.embedding.length) return cosine(a.embedding, b.embedding);
+  const sa = new Set(a.tokens), sb = new Set(b.tokens);
+  let inter = 0; for (const t of sa) if (sb.has(t)) inter++;
+  const uni = sa.size + sb.size - inter;
+  return uni ? inter / uni : 0;
+}
+// v0.7: Maximal Marginal Relevance — pick k items that are both relevant and
+// mutually dissimilar. Iteratively select argmax( rel(c) − λ·max sim(c, selected) ).
+function mmrSelect<T extends { unit: TraceUnit; score: number }>(cands: T[], k: number, lambda: number): T[] {
+  if (cands.length <= k) return cands;
+  const selected: T[] = [];
+  const pool = [...cands];
+  while (selected.length < k && pool.length) {
+    let bestIdx = 0; let bestVal = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      const c = pool[i];
+      let div = 0;
+      for (const s of selected) { const d = unitSim(c.unit, s.unit); if (d > div) div = d; }
+      const val = c.score - lambda * div;
+      if (val > bestVal) { bestVal = val; bestIdx = i; }
+    }
+    selected.push(pool[bestIdx]);
+    pool.splice(bestIdx, 1);
+  }
+  return selected;
+}
+
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
   store.ensureIndex();
 
@@ -720,12 +752,16 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
 
   const minScore = opts.minScore ?? 0.15;
   const seenFp = new Set<string>();
-  return [...have.values()]
+  const ranked = [...have.values()]
     .filter((c) => c.score > minScore)
     .sort((a, b) => b.score - a.score)
-    .filter((c) => { if (seenFp.has(c.unit.fp)) return false; seenFp.add(c.unit.fp); return true; }) // v0.3: de-dup near-identical evidence
-    .slice(0, topK)
-    .map((c) => ({ unit: c.unit, score: c.score, reason: c.reason }));
+    .filter((c) => { if (seenFp.has(c.unit.fp)) return false; seenFp.add(c.unit.fp); return true; }); // v0.3: de-dup near-identical evidence
+  // v0.7: MMR diversifies the injected set so top-K isn't several near-duplicate
+  // snippets. Diversify from a pool larger than topK, then select topK.
+  const useMmr = opts.mmr !== false && ranked.length > topK;
+  const pool = useMmr ? ranked.slice(0, Math.max(topK * 4, topK + 10)) : ranked;
+  const picked = useMmr ? mmrSelect(pool, topK, opts.mmrLambda ?? 0.5) : pool;
+  return picked.slice(0, topK).map((c) => ({ unit: c.unit, score: c.score, reason: c.reason }));
 }
 
 export function formatEvidence(hits: Hit[], snippetChars = 220): string {

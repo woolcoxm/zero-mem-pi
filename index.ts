@@ -25,6 +25,7 @@ export default async function (pi: ExtensionAPI) {
   // v0.6: slimmer per-request injection (the latency lever on slow local models).
   const injectTopK = Math.max(1, Number(process.env.ZERO_MEM_INJECT_TOPK ?? 3));
   const injectSnippet = Math.max(40, Number(process.env.ZERO_MEM_INJECT_SNIPPET ?? 120));
+  const mmrLambda = Math.min(1, Math.max(0, Number(process.env.ZERO_MEM_MMR_LAMBDA ?? 0.5))); // v0.7: relevance vs diversity
   const calibrateOn = process.env.ZERO_MEM_CALIBRATE === "1"; // v0.6: opt-in answer calibration
   let lastInjection: { query: string; hits: Hit[] } | null = null; // v0.6: for calibrate()
   store.embedder = new Embedder(); // v0.2; loads lazily on first retrieve
@@ -77,7 +78,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
-      const hits = await retrieve(query, store, { cwd: ctx.cwd, scopeToProject: store.scopeToProject, topK: injectTopK, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(query, store, { cwd: ctx.cwd, scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
       lastInjection = { query, hits };
       if (!hits.length) return;
       return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
