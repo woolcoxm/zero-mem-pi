@@ -645,6 +645,21 @@ function mmrSelect<T extends { unit: TraceUnit; score: number }>(cands: T[], k: 
   return selected;
 }
 
+// v0.9: pick an MMR λ from query shape instead of a fixed 0.5. Lookups (terse,
+// entity-packed: "whats my api key") want LOW λ — the single most relevant
+// snippet matters and diversity just dilutes it. Exploratory intent ("summarize
+// what we built") wants HIGH λ — several distinct facets beat one repeated.
+// Only consulted when the caller does NOT pass an explicit mmrLambda.
+export function adaptiveMmrLambda(query: string, ents: string[], toks: string[]): number {
+  const q = query.toLowerCase();
+  if (/\b(summari[sz]e|overview|recap|round-?up|status|catch up|list|enumerate|everything|all (the|our)|what (do|did) we|tl;?dr)\b/.test(q)) return 0.7;
+  const n = toks.length;
+  const density = n ? ents.length / n : 0;
+  if (n > 0 && n <= 6 && density >= 0.15) return 0.25; // terse + entity-packed → lookup
+  if (n >= 12) return 0.6;                              // long → likely multi-faceted
+  return Math.min(0.55, Math.max(0.4, 0.5 - density));  // neutral ~0.5, leans relevance with entities
+}
+
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
   store.ensureIndex();
 
@@ -830,7 +845,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   // v0.7: MMR diversifies the injected set so top-K isn't several near-duplicate
   // snippets. Diversify from a pool larger than topK, then select topK.
   const pool = ranked.slice(0, poolSize);
-  const picked = useMmr && pool.length > topK ? mmrSelect(pool, topK, opts.mmrLambda ?? 0.5) : pool;
+  const picked = useMmr && pool.length > topK ? mmrSelect(pool, topK, opts.mmrLambda ?? adaptiveMmrLambda(query, qEnts, qTokens)) : pool;
   return picked.slice(0, topK).map((c) => ({ unit: c.unit, score: c.score, reason: c.reason }));
 }
 

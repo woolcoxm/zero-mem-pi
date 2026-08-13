@@ -25,7 +25,7 @@ export default async function (pi: ExtensionAPI) {
   // v0.6: slimmer per-request injection (the latency lever on slow local models).
   const injectTopK = Math.max(1, Number(process.env.ZERO_MEM_INJECT_TOPK ?? 3));
   const injectSnippet = Math.max(40, Number(process.env.ZERO_MEM_INJECT_SNIPPET ?? 120));
-  const mmrLambda = Math.min(1, Math.max(0, Number(process.env.ZERO_MEM_MMR_LAMBDA ?? 0.5))); // v0.7: relevance vs diversity (v0.9: adaptive when unset, see core)
+  const mmrLambda = process.env.ZERO_MEM_MMR_LAMBDA ? Math.min(1, Math.max(0, Number(process.env.ZERO_MEM_MMR_LAMBDA))) : undefined; // v0.9: unset → adaptive (see core.adaptiveMmrLambda); set → fixed override
   const federateEnabled = process.env.ZERO_MEM_FEDERATE !== "0"; // v0.9: cross-project fallback when a project has nothing relevant
   const calibrateOn = process.env.ZERO_MEM_CALIBRATE === "1"; // v0.6: opt-in answer calibration
   let lastInjection: { query: string; hits: Hit[] } | null = null; // v0.6: for calibrate()
