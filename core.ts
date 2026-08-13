@@ -35,6 +35,8 @@ export interface RetrieveOpts {
   activeContext?: Set<string>; // v0.3: fingerprints of messages already in the model's window (excluded)
   minScore?: number;           // v0.3: relevance floor (default 0.15) — drop weak/tangential hits
   useBridges?: boolean;        // v0.4: enable co-occurrence relational bridges (default true)
+  useHnsw?: boolean;           // v0.6: HNSW ANN for semantic search at scale (default true; auto-gated by store.hnswThreshold)
+  hnswEf?: number;             // v0.6: HNSW search ef (default 200 ~ recall 0.90 at dim 384; raise for more recall)
 }
 
 export interface Hit {
@@ -295,6 +297,122 @@ export function dequantize(scale: number, bytes: Int8Array | number[]): number[]
   return out;
 }
 
+// ── Binary heap (for HNSW search) ───────────────────────────────────────────
+class Heap<T> {
+  private a: T[] = [];
+  private less: (a: T, b: T) => boolean;
+  constructor(less: (a: T, b: T) => boolean) { this.less = less; }
+  get size() { return this.a.length; }
+  peek(): T | undefined { return this.a[0]; }
+  push(x: T) { this.a.push(x); this.up(this.a.length - 1); }
+  pop(): T | undefined {
+    const n = this.a.length; if (!n) return undefined;
+    const top = this.a[0]; const last = this.a.pop()!;
+    if (n > 1) { this.a[0] = last; this.down(0); }
+    return top;
+  }
+  private up(i: number) { const a = this.a, less = this.less; while (i > 0) { const p = (i - 1) >> 1; if (less(a[i], a[p])) { const t = a[i]; a[i] = a[p]; a[p] = t; i = p; } else break; } }
+  private down(i: number) { const a = this.a, n = a.length, less = this.less; for (;;) { let l = i * 2 + 1, r = l + 1, m = i; if (l < n && less(a[l], a[m])) m = l; if (r < n && less(a[r], a[m])) m = r; if (m === i) break; const t = a[i]; a[i] = a[m]; a[m] = t; i = m; } }
+}
+
+// ── HNSW (v0.6): approximate nearest-neighbour over dense embeddings ─────────
+// Pure-JS (no native dep → no Windows build risk). Gated by a scale threshold in
+// MemoryStore so small stores use exact brute force; HNSW activates only when the
+// linear scan starts to matter (default >= 3000 units). Distance = 1 − cosine
+// (embeddings are L2-normalized, so cosine = dot product).
+export class HNSWIndex {
+  M: number; Mmax: number; Mmax0: number; efConstruction: number; mL: number;
+  unitIndex: number[] = [];            // hnsw node id -> unit array index
+  private data: number[][] = [];
+  private levelOf: number[] = [];
+  private layers: Array<Map<number, number[]>> = [];
+  private entry = -1; private entryLevel = -1;
+  private seed: number;
+  constructor(opts: { M?: number; efConstruction?: number; seed?: number } = {}) {
+    this.M = opts.M ?? 16; this.Mmax = this.M; this.Mmax0 = this.M * 2;
+    this.efConstruction = opts.efConstruction ?? 200; this.mL = 1 / Math.log(this.M);
+    this.seed = opts.seed ?? 1337;
+  }
+  get size() { return this.data.length; }
+  private rnd() { // mulberry32 PRNG (deterministic builds)
+    this.seed |= 0; this.seed = (this.seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(this.seed ^ (this.seed >>> 15), 1 | this.seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  private dist(a: number[], b: number[]) { let dot = 0; for (let i = 0; i < a.length; i++) dot += a[i] * b[i]; return 1 - dot; }
+  build(vectors: number[][]) { for (const v of vectors) this.insert(v); }
+  private neighbors(lc: number, node: number): number[] { return this.layers[lc].get(node) ?? []; }
+  private insert(q: number[]) {
+    const id = this.data.length; this.data.push(q);
+    const l = Math.floor(-Math.log(this.rnd() || 1e-12) * this.mL);
+    this.levelOf[id] = l;
+    while (this.layers.length <= l) this.layers.push(new Map());
+    for (let lc = 0; lc <= l; lc++) if (!this.layers[lc].has(id)) this.layers[lc].set(id, []);
+    if (this.entry === -1) { this.entry = id; this.entryLevel = l; return; }
+    let ep = [this.entry];
+    for (let lc = this.entryLevel; lc > l; lc--) ep = this.searchLayer(q, ep, 1, lc).map((x) => x.id);
+    for (let lc = Math.min(l, this.entryLevel); lc >= 0; lc--) {
+      const C = this.searchLayer(q, ep, this.efConstruction, lc);
+      const neigh = this.selectNeighbors(q, C, this.M);
+      this.layers[lc].set(id, neigh.map((c) => c.id));
+      const Mmax = lc === 0 ? this.Mmax0 : this.Mmax;
+      for (const c of neigh) {
+        const arr = this.layers[lc].get(c.id)!; arr.push(id);
+        if (arr.length > Mmax) {
+          const ci = this.data[c.id];
+          const kept = arr.map((n) => ({ id: n, d: this.dist(ci, this.data[n]) })).sort((a, b) => a.d - b.d).slice(0, Mmax).map((s) => s.id);
+          this.layers[lc].set(c.id, kept);
+        }
+      }
+      ep = C.map((x) => x.id);
+    }
+    if (l > this.entryLevel) { this.entry = id; this.entryLevel = l; }
+  }
+  private searchLayer(q: number[], eps: number[], ef: number, lc: number): { id: number; d: number }[] {
+    const visited = new Set<number>(eps);
+    const C = new Heap<{ id: number; d: number }>((a, b) => a.d < b.d);
+    const W = new Heap<{ id: number; d: number }>((a, b) => a.d > b.d); // max-heap: top = furthest
+    for (const e of eps) { const d = this.dist(q, this.data[e]); C.push({ id: e, d }); W.push({ id: e, d }); }
+    while (C.size) {
+      const c = C.pop()!; const f = W.peek()!;
+      if (c.d > f.d) break;
+      for (const e of this.neighbors(lc, c.id)) {
+        if (visited.has(e)) continue; visited.add(e);
+        const d = this.dist(q, this.data[e]); const worst = W.peek();
+        if (!worst || d < worst.d || W.size < ef) {
+          C.push({ id: e, d }); W.push({ id: e, d });
+          if (W.size > ef) W.pop();
+        }
+      }
+    }
+    const out: { id: number; d: number }[] = [];
+    while (W.size) out.push(W.pop()!);
+    out.sort((a, b) => a.d - b.d); // nearest first
+    return out;
+  }
+  // selectNeighborsHeuristic (Malkov-Yashunin Alg.4): keep diverse neighbors,
+  // backfill to M for connectivity. Improves recall vs plain nearest-M.
+  private selectNeighbors(q: number[], C: { id: number; d: number }[], M: number): { id: number; d: number }[] {
+    const R: { id: number; d: number }[] = [];
+    for (const e of C) {
+      if (R.length >= M) break;
+      let good = true;
+      for (const r of R) { if (this.dist(this.data[e.id], this.data[r.id]) < e.d) { good = false; break; } }
+      if (good) R.push(e);
+    }
+    for (const e of C) { if (R.length >= M) break; if (!R.includes(e)) R.push(e); }
+    return R;
+  }
+  searchUnitIndices(q: number[], k: number, ef?: number): number[] {
+    if (this.entry === -1) return [];
+    let ep = [this.entry];
+    for (let lc = this.entryLevel; lc > 0; lc--) ep = this.searchLayer(q, ep, 1, lc).map((x) => x.id);
+    const W = this.searchLayer(q, ep, Math.max(ef ?? 200, k), 0);
+    return W.slice(0, k).map((w) => this.unitIndex[w.id] ?? -1).filter((i) => i >= 0);
+  }
+}
+
 // ── Memory store ────────────────────────────────────────────────────────────
 export class MemoryStore {
   embedder: Embedder | null = null; // v0.2: optional dense embedder
@@ -309,6 +427,10 @@ export class MemoryStore {
   maxAgeMs = 90 * 24 * 3600 * 1000; // v0.5: ~90d (ZERO_MEM_MAX_AGE_DAYS)
   graph = new EntityGraph();
   bm25 = new BM25();
+  hnsw: HNSWIndex | null = null;     // v0.6: built lazily above hnswThreshold
+  hnswThreshold = 10000;            // v0.6: below this, exact brute force is faster AND exact (ZERO_MEM_HNSW_THRESHOLD)
+  hnswEnabled = true;               // v0.6: ZERO_MEM_HNSW=0 disables
+  private hnswBuiltFor = -1;        // v0.6: embedded-count the index was built for (growth-gated rebuild)
   extract: (text: string) => string[];
 
   constructor(path: string, extract: (t: string) => string[]) {
@@ -381,6 +503,22 @@ export class MemoryStore {
       buf.set(bytes, off); off += dim; // Int8 bit pattern → Uint8 (Buffer)
     }
     writeFileSync(this.embPath, buf);
+  }
+  /** v0.6: build the HNSW index over embedded units when the store crosses
+   *  hnswThreshold; below it, leave null so retrieve() uses exact brute force
+   *  (which is faster AND exact below ~10k units). Rebuild is growth-gated so a
+   *  per-message add() never triggers a multi-second rebuild — the index refreshes
+   *  only once embedded-count has grown ≥50% since the last build. */
+  buildHnswIfNeeded() {
+    if (!this.hnswEnabled) { this.hnsw = null; return; }
+    const idx: number[] = [];
+    for (let i = 0; i < this.units.length; i++) if (this.units[i].embedding && this.units[i].embedding!.length) idx.push(i);
+    if (idx.length < this.hnswThreshold) { this.hnsw = null; return; }
+    if (this.hnsw && this.hnswBuiltFor > 0 && idx.length < this.hnswBuiltFor * 1.5) return; // growth-gated: skip until +50%
+    this.hnsw = new HNSWIndex({ M: 16, efConstruction: 200 });
+    this.hnsw.build(idx.map((i) => this.units[i].embedding!));
+    this.hnsw.unitIndex = idx;
+    this.hnswBuiltFor = idx.length;
   }
   /** v0.5: bound store growth — drop units older than maxAgeMs, then trim to maxUnits. */
   enforceRetention() {
@@ -501,13 +639,22 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     }
   }
 
+  // v0.6: at scale, restrict semantic search to HNSW candidates (exact cosine
+  // re-rank after). Below hnswThreshold, store.hnsw is null -> brute force over
+  // the whole pool (identical to v0.5 behaviour).
+  let semCand: Set<number> | null = null;
+  if (useEmb && (opts.useHnsw ?? true)) {
+    store.buildHnswIfNeeded();
+    if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, topK, opts.hnswEf ?? 200));
+  }
+
   const hRaw = new Map<number, number>();
   let hMax = 0;
   for (const i of poolIdx) {
     const u = store.units[i];
     let s: number;
     if (useEmb && qEmb && u.embedding && u.embedding.length) {
-      s = (cosine(qEmb, u.embedding) + 1) / 2; // cosine [-1,1] → [0,1]
+      s = (semCand && !semCand.has(i)) ? 0 : (cosine(qEmb, u.embedding) + 1) / 2; // cosine [-1,1] → [0,1]
     } else {
       s = store.bm25.score(qTokens, i); // word-overlap fallback
     }
