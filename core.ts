@@ -356,6 +356,14 @@ export class HNSWIndex {
       if (yieldEvery > 0 && (i + 1) % yieldEvery === 0) await new Promise((r) => setImmediate(r));
     }
   }
+  // v0.9: insert a SINGLE new vector into the live index and map its node to
+  // `unitIdx` (the store's unit-array index). Keeps freshly-added units
+  // searchable at scale instead of waiting for the next growth-gated rebuild
+  // (which would otherwise leave them score-0 / invisible to semantic search
+  // until embedded-count grows +50%). Incremental inserts gradually dilute graph
+  // quality, but MemoryStore.ensureHnsw still triggers a periodic full rebuild
+  // (which subsumes these nodes and resets quality), so this is purely additive.
+  add(q: number[], unitIdx: number) { this.insert(q); this.unitIndex.push(unitIdx); }
   private neighbors(lc: number, node: number): number[] { return this.layers[lc].get(node) ?? []; }
   private insert(q: number[]) {
     const id = this.data.length; this.data.push(q);
@@ -573,12 +581,20 @@ export class MemoryStore {
     this.bm25.build(this.units);
     this.dirty = false;
   }
-  /** v0.2: embed any units still missing a semantic vector (idempotent). */
+  /** v0.2: embed any units still missing a semantic vector (idempotent).
+   *  v0.9: if the HNSW index is already live, fold each newly-embedded unit in
+   *  incrementally so it's searchable at scale right away (no waiting for the
+   *  next +50% rebuild). Skipped while a background build is in progress — that
+   *  build reads all current embeddings fresh and will include the unit anyway. */
   async embedAll() {
     if (!this.embedder || !this.embedder.ready) return;
-    for (const u of this.units) {
+    for (let i = 0; i < this.units.length; i++) {
+      const u = this.units[i];
       if (u.embedding && u.embedding.length) continue;
       u.embedding = await this.embedder.embed(u.text);
+      if (this.hnsw && this.hnswEnabled && !this.hnswBuilding) {
+        try { this.hnsw.add(u.embedding, i); } catch { /* best-effort; next rebuild recovers */ }
+      }
     }
   }
   add(partial: Omit<TraceUnit, "id" | "entities" | "tokens" | "fp">): TraceUnit {
