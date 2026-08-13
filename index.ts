@@ -25,7 +25,8 @@ export default async function (pi: ExtensionAPI) {
   // v0.6: slimmer per-request injection (the latency lever on slow local models).
   const injectTopK = Math.max(1, Number(process.env.ZERO_MEM_INJECT_TOPK ?? 3));
   const injectSnippet = Math.max(40, Number(process.env.ZERO_MEM_INJECT_SNIPPET ?? 120));
-  const mmrLambda = Math.min(1, Math.max(0, Number(process.env.ZERO_MEM_MMR_LAMBDA ?? 0.5))); // v0.7: relevance vs diversity
+  const mmrLambda = Math.min(1, Math.max(0, Number(process.env.ZERO_MEM_MMR_LAMBDA ?? 0.5))); // v0.7: relevance vs diversity (v0.9: adaptive when unset, see core)
+  const federateEnabled = process.env.ZERO_MEM_FEDERATE !== "0"; // v0.9: cross-project fallback when a project has nothing relevant
   const calibrateOn = process.env.ZERO_MEM_CALIBRATE === "1"; // v0.6: opt-in answer calibration
   let lastInjection: { query: string; hits: Hit[] } | null = null; // v0.6: for calibrate()
   store.embedder = new Embedder(); // v0.2; loads lazily on first retrieve
@@ -78,7 +79,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
-      const hits = await retrieve(query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), federate: federateEnabled, scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
       lastInjection = { query, hits };
       if (!hits.length) return;
       return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
@@ -98,7 +99,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const q = (args || "").trim();
       if (!q) { ctx.ui.notify?.(storeStats(store, ctx.cwd), "info"); return; }
-      const hits = await retrieve(q, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), topK: 8, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(q, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), federate: federateEnabled, topK: 8, activeContext: activeContextFingerprints(ctx) });
       if (!hits.length) { ctx.ui.notify?.("No matching memory.", "info"); return; }
       ctx.ui.setWidget?.("zero-mem", [formatEvidence(hits), `query: ${q}`]);
     },
@@ -131,7 +132,7 @@ export default async function (pi: ExtensionAPI) {
     }),
     async execute(_id: string, params: { query: string }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       await ensureLoaded();
-      const hits = await retrieve(params.query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), topK: 8, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(params.query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), federate: federateEnabled, topK: 8, activeContext: activeContextFingerprints(ctx) });
       return {
         content: [{ type: "text" as const, text: hits.length ? formatEvidence(hits) : "No matching memory." }],
         details: { hits: hits.length },

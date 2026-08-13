@@ -39,7 +39,9 @@ export interface RetrieveOpts {
   useHnsw?: boolean;           // v0.6: HNSW ANN for semantic search at scale (default true; auto-gated by store.hnswThreshold)
   hnswEf?: number;             // v0.6: HNSW search ef (default 200 ~ recall 0.90 at dim 384; raise for more recall)
   mmr?: boolean;               // v0.7: maximal-marginal-relevance diversity selection (default true)
-  mmrLambda?: number;          // v0.7: relevance vs diversity tradeoff, 0=relevance-only 1=diversity-only (default 0.5)
+  mmrLambda?: number;          // v0.7: relevance vs diversity tradeoff, 0=relevance-only 1=diversity-only (default 0.5; v0.9: auto when omitted)
+  federate?: boolean;          // v0.9: when project scoping yields nothing relevant, reach across to OTHER projects (penalized). Default true; only fires on an empty in-project result.
+  federatePenalty?: number;    // v0.9: score multiplier for cross-project hits (default 0.7 — ranks them below a real in-project answer of equal strength).
 }
 
 export interface Hit {
@@ -669,7 +671,12 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   if (!qTokens.length && !qEnts.length) return [];
   const cutoff = Date.now() - recentExcludeMs;
 
-  const poolIdx: number[] = [];
+  // v0.9: split into in-project vs cross-project pools. Cross-project is scored
+  // (and penalized) ONLY when the in-project pool yields nothing above minScore
+  // — i.e. when project scoping is "too narrow". Otherwise scoping is respected
+  // exactly as before, so a project that has its own answer never leaks across.
+  const inIdx: number[] = [];
+  const outIdx: number[] = [];
   for (let i = 0; i < store.units.length; i++) {
     const u = store.units[i];
     // v0.8: recent-exclusion is now SESSION-SCOPED. A unit from the *current*
@@ -681,11 +688,10 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     // facts for 2 minutes across ALL sessions, so e.g. a name told to the agent
     // was unrecoverable in any new conversation opened within 2 minutes.)
     if (opts.sessionId && u.sessionId === opts.sessionId && u.timestamp >= cutoff) continue;
-    if (scopeToProject && u.cwd !== opts.cwd) continue;
     if (opts.activeContext?.has(u.fp)) continue; // v0.3: skip what's already in the model's context window
-    poolIdx.push(i);
+    if (scopeToProject && u.cwd !== opts.cwd) outIdx.push(i); else inIdx.push(i);
   }
-  if (!poolIdx.length) return [];
+  if (!inIdx.length && !outIdx.length) return [];
 
   const gRaw = new Map<string, number>();
   if (qEnts.length) for (const [uid, cnt] of store.graph.queryEntities(qEnts)) gRaw.set(uid, cnt);
@@ -718,19 +724,28 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, poolSize, opts.hnswEf ?? 200));
   }
 
-  const hRaw = new Map<number, number>();
-  let hMax = 0;
-  for (const i of poolIdx) {
-    const u = store.units[i];
-    let s: number;
-    if (useEmb && qEmb && u.embedding && u.embedding.length) {
-      s = (semCand && !semCand.has(i)) ? 0 : (cosine(qEmb, u.embedding) + 1) / 2; // cosine [-1,1] → [0,1]
-    } else {
-      s = store.bm25.score(qTokens, i); // word-overlap fallback
+  // v0.9: score a pool of unit indices → {raw scores, max}. Each pool is h-normalized
+  // INDEPENDENTLY so an in-project hit and a cross-project hit are each comparable to
+  // 1.0 *before* the federation penalty ranks cross-project down. (Previously the whole
+  // pool was one set normalized by a single hMax.)
+  const scorePool = (idx: number[]): { raw: Map<number, number>; max: number } => {
+    const raw = new Map<number, number>();
+    let max = 0;
+    for (const i of idx) {
+      const u = store.units[i];
+      let s: number;
+      if (useEmb && qEmb && u.embedding && u.embedding.length) {
+        s = (semCand && !semCand.has(i)) ? 0 : (cosine(qEmb, u.embedding) + 1) / 2; // cosine [-1,1] → [0,1]
+      } else {
+        s = store.bm25.score(qTokens, i); // word-overlap fallback
+      }
+      raw.set(i, s);
+      if (s > max) max = s;
     }
-    hRaw.set(i, s);
-    if (s > hMax) hMax = s;
-  }
+    return { raw, max };
+  };
+  const minScore = opts.minScore ?? 0.15; // (hoisted from below; v0.9 federation needs it before the cross-project decision)
+  const inPool = scorePool(inIdx);
 
   const entityDriven = qEnts.length > 0;
   const temporal = /\b(earlier|before|last|previous|yesterday|ago|used to|recently|back when)\b/i.test(query);
@@ -743,16 +758,37 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   for (const v of gRaw.values()) if (v > gMax) gMax = v;
 
   type Cand = { idx: number; unit: TraceUnit; score: number; reason: string };
+  const hLabel = useEmb ? "semantics" : "lexical";
+  const reasonFor = (g: number, h: number, cross = false) => {
+    const base = g > 0 && h > 0 ? `graph+${hLabel}` : g > 0 ? "graph" : hLabel;
+    return cross ? `${base}+cross-project` : base;
+  };
   const cands: Cand[] = [];
-  for (const i of poolIdx) {
+  for (const i of inIdx) {
     const u = store.units[i];
     const g = gMax ? (gRaw.get(u.id) ?? 0) / gMax : 0;
-    const h = hMax ? (hRaw.get(i) ?? 0) / hMax : 0;
+    const h = inPool.max ? (inPool.raw.get(i) ?? 0) / inPool.max : 0;
     const score = wGraph * g + wHier * h;
     if (score <= 0) continue;
-    const hLabel = useEmb ? "semantics" : "lexical";
-    const reason = g > 0 && h > 0 ? `graph+${hLabel}` : g > 0 ? "graph" : hLabel;
-    cands.push({ idx: i, unit: u, score, reason });
+    cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h) });
+  }
+  // v0.9: cross-project federation — ONLY when the in-project pool has nothing
+  // above minScore (project scoping is too narrow). Cross-project hits are
+  // h-normalized within their OWN pool, then penalized so they rank below a
+  // real in-project answer of equal strength. The instant the current project
+  // answers the query, this block is skipped and nothing leaks across.
+  if ((opts.federate ?? true) && scopeToProject && outIdx.length > 0 &&
+      !cands.some((c) => c.score > minScore)) {
+    const outPool = scorePool(outIdx);
+    const federatePenalty = opts.federatePenalty ?? 0.7;
+    for (const i of outIdx) {
+      const u = store.units[i];
+      const g = gMax ? (gRaw.get(u.id) ?? 0) / gMax : 0;
+      const h = outPool.max ? (outPool.raw.get(i) ?? 0) / outPool.max : 0;
+      const score = federatePenalty * (wGraph * g + wHier * h);
+      if (score <= 0) continue;
+      cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h, true) });
+    }
   }
 
   // Evidence closure: 1-hop graph neighbors + session-adjacent turns.
@@ -786,7 +822,6 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     }
   }
 
-  const minScore = opts.minScore ?? 0.15;
   const seenFp = new Set<string>();
   const ranked = [...have.values()]
     .filter((c) => c.score > minScore)
