@@ -78,7 +78,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
-      const hits = await retrieve(query, store, { cwd: ctx.cwd, scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
       lastInjection = { query, hits };
       if (!hits.length) return;
       return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
@@ -98,7 +98,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const q = (args || "").trim();
       if (!q) { ctx.ui.notify?.(storeStats(store, ctx.cwd), "info"); return; }
-      const hits = await retrieve(q, store, { cwd: ctx.cwd, topK: 8, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(q, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), topK: 8, activeContext: activeContextFingerprints(ctx) });
       if (!hits.length) { ctx.ui.notify?.("No matching memory.", "info"); return; }
       ctx.ui.setWidget?.("zero-mem", [formatEvidence(hits), `query: ${q}`]);
     },
@@ -131,7 +131,7 @@ export default async function (pi: ExtensionAPI) {
     }),
     async execute(_id: string, params: { query: string }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       await ensureLoaded();
-      const hits = await retrieve(params.query, store, { cwd: ctx.cwd, topK: 8, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(params.query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), topK: 8, activeContext: activeContextFingerprints(ctx) });
       return {
         content: [{ type: "text" as const, text: hits.length ? formatEvidence(hits) : "No matching memory." }],
         details: { hits: hits.length },

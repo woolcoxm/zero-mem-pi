@@ -28,6 +28,7 @@ export interface TraceUnit {
 
 export interface RetrieveOpts {
   cwd: string;
+  sessionId?: string;        // v0.8: current session — recent-exclusion is scoped to it
   scopeToProject?: boolean;
   topK?: number;
   recentExcludeMs?: number;
@@ -671,7 +672,15 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   const poolIdx: number[] = [];
   for (let i = 0; i < store.units.length; i++) {
     const u = store.units[i];
-    if (u.timestamp >= cutoff) continue;
+    // v0.8: recent-exclusion is now SESSION-SCOPED. A unit from the *current*
+    // session younger than recentExcludeMs is almost certainly still in the
+    // model's context window (activeContext fingerprints catch exact dupes;
+    // this is a backstop for near-paraphrases). Units from OTHER sessions must
+    // never be time-excluded — a fact learned seconds ago in a prior session
+    // has to be recallable immediately. (Previously this dropped freshly-stored
+    // facts for 2 minutes across ALL sessions, so e.g. a name told to the agent
+    // was unrecoverable in any new conversation opened within 2 minutes.)
+    if (opts.sessionId && u.sessionId === opts.sessionId && u.timestamp >= cutoff) continue;
     if (scopeToProject && u.cwd !== opts.cwd) continue;
     if (opts.activeContext?.has(u.fp)) continue; // v0.3: skip what's already in the model's context window
     poolIdx.push(i);
