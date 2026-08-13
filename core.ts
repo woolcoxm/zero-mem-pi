@@ -739,3 +739,60 @@ export function formatEvidence(hits: Hit[], snippetChars = 220): string {
   }
   return lines.join("\n");
 }
+
+// ── Answer-level calibration (v0.6) ───────────────────────────────────────────
+// Deterministic, zero-LLM checks on the reader's (model's) output. The paper's
+// component #4: validate type/format, detect imbalance, and flag over-reliance on
+// injected memory. NON-DESTRUCTIVE — it never rewrites the model's answer, only
+// emits warnings (opt-in via ZERO_MEM_CALIBRATE=1 in index.ts).
+export interface CalibrateOpts {
+  hits?: Hit[];                              // evidence that was injected
+  query?: string;                            // the user prompt
+  expects?: "json" | "code" | "text";        // optional type expectation
+  extract?: (t: string) => string[];         // entity extractor (coverage signal)
+}
+export interface CalibrationResult {
+  ok: boolean;
+  warnings: string[];
+  signals: { fences: number; jsonParses?: boolean; entityCoverage: number; verbatimMemory: boolean };
+}
+function stripFences(s: string): string {
+  return s.trim().replace(/^```[a-zA-Z0-9]*\n?/, "").replace(/\n?```$/, "");
+}
+export function calibrate(response: string, opts: CalibrateOpts = {}): CalibrationResult {
+  const warnings: string[] = [];
+  const fences = (response.match(/```/g) ?? []).length;
+  if (fences % 2 !== 0) warnings.push(`unbalanced code fence (count=${fences})`);
+
+  let jsonParses: boolean | undefined;
+  if (opts.expects === "json") {
+    try { JSON.parse(stripFences(response)); jsonParses = true; }
+    catch (e: any) { jsonParses = false; warnings.push(`expected JSON but parse failed: ${(e?.message ?? e)}`); }
+  }
+
+  let entityCoverage = 1;
+  if (opts.query && opts.extract) {
+    const qEnts = opts.extract(opts.query);
+    if (qEnts.length) {
+      const lower = response.toLowerCase();
+      const hit = qEnts.filter((e) => lower.includes(e.toLowerCase())).length;
+      entityCoverage = hit / qEnts.length;
+      if (entityCoverage === 0) warnings.push(`response mentions none of the ${qEnts.length} query entities`);
+    }
+  }
+
+  let verbatimMemory = false;
+  if (opts.hits && opts.hits.length) {
+    const lower = response.toLowerCase();
+    for (const h of opts.hits) {
+      const snip = h.unit.text.replace(/\s+/g, " ").trim().slice(0, 80).toLowerCase();
+      if (snip.length > 30 && lower.includes(snip)) {
+        verbatimMemory = true;
+        warnings.push(`response reproduces injected memory verbatim (unit ${h.unit.id}) — memory is not authoritative`);
+        break;
+      }
+    }
+  }
+
+  return { ok: warnings.length === 0, warnings, signals: { fences, jsonParses, entityCoverage, verbatimMemory } };
+}

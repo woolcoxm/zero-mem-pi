@@ -7,7 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { MemoryStore, Embedder, retrieve, formatEvidence, makeExtractor, flattenContent, fingerprint } from "./core.ts";
+import { MemoryStore, Embedder, retrieve, formatEvidence, makeExtractor, flattenContent, fingerprint, calibrate, type Hit } from "./core.ts";
 
 type Role = "user" | "assistant" | "tool";
 
@@ -25,6 +25,8 @@ export default async function (pi: ExtensionAPI) {
   // v0.6: slimmer per-request injection (the latency lever on slow local models).
   const injectTopK = Math.max(1, Number(process.env.ZERO_MEM_INJECT_TOPK ?? 3));
   const injectSnippet = Math.max(40, Number(process.env.ZERO_MEM_INJECT_SNIPPET ?? 120));
+  const calibrateOn = process.env.ZERO_MEM_CALIBRATE === "1"; // v0.6: opt-in answer calibration
+  let lastInjection: { query: string; hits: Hit[] } | null = null; // v0.6: for calibrate()
   store.embedder = new Embedder(); // v0.2; loads lazily on first retrieve
   let loaded = false;
   const ensureLoaded = async () => { if (!loaded) { store.load(); loaded = true; } };
@@ -45,6 +47,14 @@ export default async function (pi: ExtensionAPI) {
       const role: string = msg.role;
       if (role !== "user" && role !== "assistant" && role !== "toolResult") return;
       let text = flattenContent(msg.content);
+      // v0.6: opt-in deterministic calibration of the model's own answer.
+      if (calibrateOn && role === "assistant" && text.trim().length > 0) {
+        try {
+          const r = calibrate(text, { hits: lastInjection?.hits, query: lastInjection?.query, extract });
+          if (!r.ok) ctx.ui.notify?.(`[zero-mem calibrate] ${r.warnings.join("; ")}`, "warn");
+          else if (ctx.hasUI) ctx.ui.setStatus?.("zero-mem-calibrate", "calibrate: ok");
+        } catch { /* best-effort */ }
+      }
       if (role === "toolResult") text = text.slice(0, 500);
       if (!text || text.trim().length < 3) return;
       if (/^[\s.!?,;:]+$/.test(text)) return;
@@ -68,6 +78,7 @@ export default async function (pi: ExtensionAPI) {
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
       const hits = await retrieve(query, store, { cwd: ctx.cwd, scopeToProject: store.scopeToProject, topK: injectTopK, activeContext: activeContextFingerprints(ctx) });
+      lastInjection = { query, hits };
       if (!hits.length) return;
       return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
     } catch (e) { console.error("[zero-mem] before_agent_start error:", e); }
