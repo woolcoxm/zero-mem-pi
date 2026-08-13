@@ -251,6 +251,8 @@ export class Embedder {
   ready = false;
   dim = 384;
   private loading: Promise<void> | null = null;
+  model: string = "Xenova/bge-small-en-v1.5"; // v0.10: upgraded from MiniLM (LoCoMo pure-semantic r@5 0.27→0.42, much stronger discrimination)
+  constructor(model?: string) { if (model !== undefined) this.model = model; }
 
   async init(): Promise<void> {
     if (this.loading) return this.loading;
@@ -260,9 +262,9 @@ export class Embedder {
         const env = mod.env;
         env.allowLocalModels = false;        // fetch from HF hub
         env.backends?.onnx?.wasm?.setThreads?.(1);
-        this.pipe = await mod.pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { quantized: true });
+        this.pipe = await mod.pipeline("feature-extraction", this.model, { quantized: true });
         this.ready = true;
-        console.log("[zero-mem] embeddings ready (all-MiniLM-L6-v2)");
+        console.log(`[zero-mem] embeddings ready (${this.model})`);
       } catch (e: any) {
         console.warn("[zero-mem] embeddings unavailable — using BM25 fallback:", e?.message ?? e);
         this.ready = false;
@@ -466,9 +468,10 @@ export class MemoryStore {
     this.extract = extract;
   }
   load() {
+    let raw: any = null;
     try {
       if (existsSync(this.path)) {
-        const raw = JSON.parse(readFileSync(this.path, "utf8"));
+        raw = JSON.parse(readFileSync(this.path, "utf8"));
         this.units = Array.isArray(raw?.units) ? raw.units : [];
         for (const u of this.units) if (!u.tokens || !u.tokens.length) u.tokens = tokenize(u.text); // v0.7: tokens not persisted; recompute from text
         this.scopeToProject = raw?.scopeToProject ?? true;
@@ -478,6 +481,14 @@ export class MemoryStore {
       // (legacy store, pre-migration) units keep their inline arrays in memory;
       // the next persist() migrates them out into the sidecar.
       this.loadEmbeddings();
+      // v0.10: re-embed if the model changed OR the store predates the stamp
+      // (absent stamp ⇒ legacy vectors from an unknown model). `raw` is hoisted
+      // out of the `if` above so it's in scope here (this was the v0.10 load bug).
+      if (this.embedder && raw?.embedder !== this.embedder.model) {
+        const stale = this.units.filter((u) => u.embedding && u.embedding.length).length;
+        if (stale) console.log(`[zero-mem] embedder ${raw?.embedder ? `'${raw.embedder}'→` : ""}'${this.embedder.model}'; re-embedding ${stale} units on next use`);
+        for (const u of this.units) u.embedding = undefined;
+      }
       this.enforceRetention();
     } catch (e) { console.error("[zero-mem] failed to load store:", e); }
     this.dirty = true;
@@ -627,7 +638,7 @@ export class MemoryStore {
       // quantized to int8 in the .bin sidecar (~21x smaller than inline JSON).
       // v0.7: tokens are NOT persisted (recomputed from text on load) to shrink the JSON further.
       const stubs = this.units.map((u) => { const { tokens, embedding, ...rest } = u; return rest; });
-      writeFileSync(this.path, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter }));
+      writeFileSync(this.path, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter, embedder: this.embedder?.model }));
       this.writeEmbeddings(this.units);
     } catch (e) { console.error("[zero-mem] failed to persist:", e); }
   }
