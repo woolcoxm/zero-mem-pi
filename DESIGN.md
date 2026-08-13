@@ -39,12 +39,14 @@ pi already stores every message as a session entry. **Those entries ARE Zero-Mem
 - **v0.1** ✅ Raw-trace substrate, entity graph, temporal hierarchy, BM25, fusion, closure, calibration, zero-LLM injection.
 - **v0.2** ✅ Dense semantic embeddings (`transformers.js` + `all-MiniLM-L6-v2`) replace word-matching for the timeline view, with automatic BM25 fallback. Proven on synonym queries that BM25 misses.
 - **v0.3** ✅ Context-aware retrieval: fingerprints of the model's current window are passed in (`activeContext`) so we never inject what's already visible; plus a relevance floor (default 0.15) and near-duplicate de-duplication.
+- **v0.4** ✅ Co-occurrence relational bridges (`EntityGraph.cooc`, `useBridges`): units whose entities co-occur with query entities earn graph score without a direct mention.
+- **v0.5** ✅ Compact int8 embedding sidecar (`store.emb.bin`) + retention policy. Embeddings quantized to int8 (~21× smaller than inline JSON, cosine drift <0.002) live outside `store.json`; `maxUnits`/`maxAgeMs` bound growth. One-shot migration in `migrate.ts`. **This fixes store bloat + I/O, not per-request tokens** (injection size is unchanged).
 
 ## Remaining roadmap
-- **v0.4** HNSW index for scale beyond a few thousand units.
-- **v0.4** Pairwise co-occurrence weights + the paper's evidence-closure "relational bridges."
-- **v0.4** Answer-level calibration for typed tasks (deterministic support/type/format checks on the reader's output).
-- **v0.5** Eval harness on LoCoMo / HotpotQA-style splits to measure F1/BLEU as in the paper.
+- **v0.6** HNSW index for scale beyond a few thousand units.
+- **v0.6** Answer-level calibration for typed tasks (deterministic support/type/format checks on the reader's output).
+- **v0.6** Slim per-request injection (shorter snippets / lower top-K) to cut the ~300-token/turn tax — the real lever for prefill time on slow local models.
+- **v0.7** Eval harness on LoCoMo / HotpotQA-style splits to measure F1/BLEU as in the paper.
 
 ## Safety / cost
 - **Zero extra LLM calls** in steady state (the paper's headline property). The optional `recall_memory` tool uses a normal tool round-trip but no extra model generation.

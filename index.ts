@@ -20,6 +20,8 @@ export default async function (pi: ExtensionAPI) {
   const storePath = process.env.ZERO_MEM_STORE ??
     join(homedir(), ".pi", "agent", "zero-mem", "store.json");
   const store = new MemoryStore(storePath, extract);
+  if (process.env.ZERO_MEM_MAX_UNITS) store.maxUnits = Number(process.env.ZERO_MEM_MAX_UNITS) || store.maxUnits; // v0.5 retention
+  if (process.env.ZERO_MEM_MAX_AGE_DAYS) store.maxAgeMs = (Number(process.env.ZERO_MEM_MAX_AGE_DAYS) || 0) * 24 * 3600 * 1000; // v0.5
   store.embedder = new Embedder(); // v0.2; loads lazily on first retrieve
   let loaded = false;
   const ensureLoaded = async () => { if (!loaded) { store.load(); loaded = true; } };
