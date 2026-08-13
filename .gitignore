@@ -4,3 +4,8 @@ node_modules/
 .DS_Store
 # zero-mem local stores (if ever created in-tree)
 store.json
+
+# locomo eval cache (2.8MB dataset + per-run stores)
+.locomo10.json
+.locomo10.json.run-*.json
+.zm-*-test.json
