@@ -153,8 +153,10 @@ out-of-domain. The v0.9 **coverage router** fixes it: blend BM25 + dense by
 the query's lexical coverage, so BM25 carries factual lookups (high coverage)
 while dense rescues synonym/paraphrase queries whose terms are OOV (low
 coverage). Result: **0.534 (≥ BM25) on LoCoMo** *and* **0.92 on the paraphrase
-eval** (vs BM25's 0.75) — best-of-both, no regressions. (Reader-based
-end-to-end F1/BLEU is a v0.10 item — it needs a running LLM endpoint.)
+eval** (vs BM25's 0.75) — best-of-both, no regressions. For the paper's actual
+metric — end-to-end answer F1/EM/BLEU with an LLM reader — see `eval-reader.ts`
+(runs the moment an OpenAI-compatible endpoint is up; falls back to retrieval
+hit-rate otherwise). Embeddings are bit-exact deterministic across runs.
 
 ## Tests
 
@@ -170,6 +172,7 @@ node --experimental-strip-types test-adaptive.ts   # v0.9 adaptive MMR lambda (5
 node --experimental-strip-types test-incremental.ts # v0.9 HNSW incremental insert (7/7)
 node --experimental-strip-types eval.ts            # retrieval eval: recall@K / MRR ablation
 node --experimental-strip-types eval-locomo.ts     # retrieval eval on real LoCoMo10 (caches ~2.8MB dataset)
+node --experimental-strip-types eval-reader.ts      # END-TO-END: LLM-reader F1/EM/BLEU on LoCoMo (falls back to hit-rate w/o endpoint)
 node --experimental-strip-types bench.ts           # A/B benchmark (store I/O + token overhead)
 ```
 
