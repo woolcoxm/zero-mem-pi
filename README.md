@@ -96,11 +96,13 @@ HNSW recall@10 vs exact brute force: 90–96% at `ef=200` (dim 384); below 10k u
 ## Tests
 
 ```bash
-node --experimental-strip-types test-storage.ts   # int8 round-trip, size, retention, migration (6/6)
-node --experimental-strip-types test-hnsw.ts      # HNSW recall vs brute, retrieve overlap, threshold guard (3/3)
-node --experimental-strip-types test-calibrate.ts # fence/json/coverage/verbatim checks (8/8)
-node --experimental-strip-types test.ts           # v0.4 co-occurrence relational bridges
-node --experimental-strip-types bench.ts          # A/B benchmark (store I/O + token overhead)
+node --experimental-strip-types test-storage.ts    # int8 round-trip, size, retention, migration (7/7)
+node --experimental-strip-types test-hnsw.ts       # HNSW recall vs brute, async build, threshold guard (5/5)
+node --experimental-strip-types test-mmr.ts        # MMR reduces pairwise redundancy (3/3)
+node --experimental-strip-types test-calibrate.ts  # fence/json/coverage/verbatim checks (8/8)
+node --experimental-strip-types test.ts            # v0.4 co-occurrence relational bridges
+node --experimental-strip-types eval.ts            # retrieval eval: recall@K / MRR ablation
+node --experimental-strip-types bench.ts           # A/B benchmark (store I/O + token overhead)
 ```
 
 Requires Node ≥ 22 (for `--experimental-strip-types`). The live MiniLM embedder is
@@ -108,7 +110,8 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
-**v0.6** — raw-trace memory, dense semantic embeddings, context-aware + co-occurrence-bridge
-retrieval, compact int8 storage with retention, slim per-request injection, HNSW at scale,
-and opt-in answer calibration. Remaining work (eval harness, async HNSW build, MMR injection
-pruning) is documented in [`DESIGN.md`](./DESIGN.md).
+**v0.7** — raw-trace memory, dense semantic embeddings, context-aware + co-occurrence-bridge
+retrieval, compact int8 storage with retention, slim + MMR-diversified per-request injection,
+async HNSW at scale, opt-in answer calibration, and a deterministic retrieval eval harness
+(semantic recall@5 0.96 vs BM25 0.75). Remaining work (true LoCoMo/LLM F1-BLEU eval, incremental
+HNSW, adaptive λ, cross-project federation) is documented in [`DESIGN.md`](./DESIGN.md).

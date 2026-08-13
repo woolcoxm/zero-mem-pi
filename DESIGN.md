@@ -42,12 +42,13 @@ pi already stores every message as a session entry. **Those entries ARE Zero-Mem
 - **v0.4** ✅ Co-occurrence relational bridges (`EntityGraph.cooc`, `useBridges`): units whose entities co-occur with query entities earn graph score without a direct mention.
 - **v0.5** ✅ Compact int8 embedding sidecar (`store.emb.bin`) + retention policy. Embeddings quantized to int8 (~21× smaller than inline JSON, cosine drift <0.002) live outside `store.json`; `maxUnits`/`maxAgeMs` bound growth. One-shot migration in `migrate.ts`. **This fixes store bloat + I/O, not per-request tokens** (injection size is unchanged).
 - **v0.6** ✅ (1) Slimmer per-request injection — header 46→19 tok, default `topK` 5→3 / snippet 220→120ch (294→112 tok/turn, ≈1.9 s prefill saved on a 95 tok/s model). (2) HNSW ANN index over embeddings (pure-JS, gated at `hnswThreshold`=10000 where it starts to beat exact brute force; growth-gated rebuild so a per-message add never rebuilds). (3) Deterministic answer-level calibration (opt-in, non-destructive): code-fence / JSON / entity-coverage / verbatim-memory checks.
+- **v0.7** ✅ (1) Stripped `tokens` from `store.json` (recomputed on load; text store ~25% smaller). (2) MMR diversity pruning for injection (`mmr`/`mmrLambda`; cuts redundant snippets). (3) Async background HNSW build (`HNSWIndex.buildAsync`, event-loop-yielding; `retrieve()` falls back to exact brute force until ready, so a >10k rebuild never stalls a turn). (4) Deterministic retrieval eval harness (`eval.ts`): recall@K / MRR ablation — semantic embeddings lift recall@5 0.75→0.96 vs BM25.
 
 ## Remaining roadmap
-- **v0.7** Eval harness on LoCoMo / HotpotQA-style splits to measure F1/BLEU as in the paper.
-- **v0.7** Background/async HNSW build so the rare large-scale rebuild never stalls a turn.
-- **v0.7** Diversity-aware injection pruning (MMR) instead of fixed topK + snippet caps.
-- **v0.7** Strip the `tokens` field from `store.json` (recompute on load) to shrink the text store further.
+- **v0.8** True paper eval: run against real LoCoMo with an LLM reader for end-to-end F1/BLEU (needs dataset + model; `eval.ts` covers the deterministic retrieval view meanwhile).
+- **v0.8** HNSW incremental insert (add-time graph updates) instead of growth-gated full rebuilds.
+- **v0.8** Adaptive MMR λ (lower for entity-specific lookups, higher for exploratory queries).
+- **v0.8** Cross-project federation when `scopeToProject` is too narrow.
 
 ## Safety / cost
 - **Zero extra LLM calls** in steady state (the paper's headline property). The optional `recall_memory` tool uses a normal tool round-trip but no extra model generation.
