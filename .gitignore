@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.env
+.DS_Store
+# zero-mem local stores (if ever created in-tree)
+store.json
