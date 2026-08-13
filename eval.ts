@@ -96,13 +96,17 @@ store.ensureIndex();
 
 const queries = [...goldById.keys()];
 const K3 = 3, K5 = 5;
+// Tuning hook (env): FUSION=off|max|weighted [+ SEM_W]. Default {} ⇒ core defaults.
+const FENV = process.env.FUSION === "off" ? { hybrid: false }
+  : process.env.FUSION ? { hybrid: true, fusion: process.env.FUSION as "max" | "weighted" | "coverage", semanticWeight: Number(process.env.SEM_W ?? 0.5) }
+  : {};
 
 interface Cfg { name: string; run: () => Promise<{ r3: number; r5: number; mrr: number; tok: number }>; }
 const measure = async (opts: any) => {
   let hit3 = 0, hit5 = 0, mrr = 0, tok = 0;
   for (const q of queries) {
     const gold = goldById.get(q)!;
-    const hits = await retrieve(q, store, { cwd, topK: K5, recentExcludeMs: 0, ...opts });
+    const hits = await retrieve(q, store, { cwd, topK: K5, recentExcludeMs: 0, ...FENV, ...opts });
     const ids = hits.map((h) => h.unit.id);
     const rank = ids.indexOf(gold) + 1;
     if (rank > 0 && rank <= K3) hit3++;

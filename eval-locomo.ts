@@ -58,6 +58,10 @@ function buildStore(utts: { dia_id: string; text: string }[], embedder: Embedder
 }
 
 const R_OPTS = { cwd: "C:/locomo", sessionId: "eval-query", scopeToProject: false, topK: TOPN, minScore: 0, mmr: false, useHnsw: false } as const;
+// CORE production fusion under test (env-tunable): default max; FUSION=off ⇒ v0.8 dense-only; FUSION=weighted [+SEM_W].
+const FENV = process.env.FUSION === "off" ? { hybrid: false }
+  : process.env.FUSION === "weighted" ? { hybrid: true, fusion: "weighted" as const, semanticWeight: Number(process.env.SEM_W ?? 0.5) }
+  : { hybrid: true, fusion: "coverage" as const };
 const rankOf = (hits: any[], dia: Map<string, string>, gold: Set<string>) => { for (let i = 0; i < hits.length; i++) if (gold.has(dia.get(hits[i].unit.id) ?? "")) return i; return -1; };
 
 type Acc = { r1: number; r3: number; r5: number; mrr: number; n: number };
@@ -73,7 +77,7 @@ console.log(`[locomo] ${convs.length} conversations, ${convs.reduce((s, c) => s 
 const embedder = new Embedder(); await embedder.init();
 console.log(`[locomo] embedder ready: ${embedder.ready}`);
 
-const bm = newAcc(), sem = newAcc(), hyb = newAcc();
+const bm = newAcc(), sem = newAcc(), hyb = newAcc(), core = newAcc();
 for (let ci = 0; ci < convs.length; ci++) {
   const utts = uttsOf(convs[ci].conversation);
   const qas: any[] = convs[ci].qa;
@@ -83,9 +87,11 @@ for (let ci = 0; ci < convs.length; ci++) {
   for (const q of qas) {
     const gold = new Set<string>(q.evidence ?? []);
     const bh = await retrieve(q.question, B.store, R_OPTS);
-    const sh = await retrieve(q.question, S.store, R_OPTS);
+    const sh = await retrieve(q.question, S.store, { ...R_OPTS, hybrid: false }); // PURE semantic (v0.8) baseline
     bump(bm, rankOf(bh, B.dia, gold));
     bump(sem, rankOf(sh, S.dia, gold));
+    const ch = await retrieve(q.question, S.store, { ...R_OPTS, ...FENV });
+    bump(core, rankOf(ch, S.dia, gold));
     // RRF fusion over dia_id
     const rrf = new Map<string, number>();
     bh.forEach((h, i) => { const d = B.dia.get(h.unit.id); if (d) rrf.set(d, (rrf.get(d) ?? 0) + 1 / (RRF_K + i)); });
@@ -104,16 +110,18 @@ console.log(" ZERO-MEM v0.9 — retrieval on LoCoMo10 (gold-evidence dia_id in t
 console.log("========================================================================");
 console.log(`  BM25 only            ${fmt(bm)}`);
 console.log(`  + semantic (MiniLM)  ${fmt(sem)}`);
+console.log(`  CORE hybrid (${FENV.fusion ?? "off"}${FENV.semanticWeight != null ? ",w=" + FENV.semanticWeight : ""})     ${fmt(core)}`);
 console.log(`  HYBRID (RRF, k=${RRF_K})    ${fmt(hyb)}`);
 console.log("========================================================================");
 const n = bm.n || 1;
-console.log(`  recall@5:  BM25 ${p(bm.r5 / n)}  ·  semantic ${p(sem.r5 / n)}  ·  hybrid ${p(hyb.r5 / n)}`);
-console.log(`  MRR:       BM25 ${p(bm.mrr / n)}  ·  semantic ${p(sem.mrr / n)}  ·  hybrid ${p(hyb.mrr / n)}`);
+console.log(`  recall@5:  BM25 ${p(bm.r5 / n)}  ·  semantic ${p(sem.r5 / n)}  ·  CORE ${p(core.r5 / n)}  ·  RRF ${p(hyb.r5 / n)}`);
+console.log(`  MRR:       BM25 ${p(bm.mrr / n)}  ·  semantic ${p(sem.mrr / n)}  ·  CORE ${p(core.mrr / n)}  ·  RRF ${p(hyb.mrr / n)}`);
 
 let pass = 0, fail = 0;
 const check = (name: string, cond: boolean, extra = "") => { if (cond) { pass++; console.log(`  \u2713 ${name} ${extra}`); } else { fail++; console.log(`  \u2717 ${name} ${extra}`); } };
 check("BM25 recall@5 > 0.30 (retrieval works on real data)", bm.r5 / n > 0.30, `(actual ${p(bm.r5 / n)})`);
 check("semantic recall@5 > 0 (dense path functional)", sem.r5 > 0);
+check("CORE hybrid recall@5 >= BM25 recall@5 (fusion recovers lexical strength)", core.r5 / n >= bm.r5 / n, `(CORE ${p(core.r5 / n)} vs BM25 ${p(bm.r5 / n)})`);
 check("BM25 recall@5 >= semantic recall@5 (lexical dominates LoCoMo factual lookups)", bm.r5 / n >= sem.r5 / n, `(BM25 ${p(bm.r5 / n)} vs semantic ${p(sem.r5 / n)})`);
 console.log(`\nRESULTS: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

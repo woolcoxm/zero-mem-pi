@@ -42,6 +42,9 @@ export interface RetrieveOpts {
   mmrLambda?: number;          // v0.7: relevance vs diversity tradeoff, 0=relevance-only 1=diversity-only (default 0.5; v0.9: auto when omitted)
   federate?: boolean;          // v0.9: when project scoping yields nothing relevant, reach across to OTHER projects (penalized). Default true; only fires on an empty in-project result.
   federatePenalty?: number;    // v0.9: score multiplier for cross-project hits (default 0.7 — ranks them below a real in-project answer of equal strength).
+  hybrid?: boolean;            // v0.9: fuse lexical (BM25) + dense (cosine) instead of dense-only when an embedder is loaded (default true).
+  fusion?: "weighted" | "max" | "coverage"; // v0.9: hybrid strategy. "coverage" (default) blends by query lexical coverage; "max" best-of-both; "weighted" by semanticWeight.
+  semanticWeight?: number;     // v0.9: dense share for "weighted" fusion, 0=BM25-only .. 1=semantic-only (default 0.5).
 }
 
 export interface Hit {
@@ -700,6 +703,10 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   const qTokens = tokenize(query);
   const qEnts = store.extract(query);
   if (!qTokens.length && !qEnts.length) return [];
+  // v0.9: lexical coverage — fraction of query terms present in the corpus. High ⇒ BM25
+  // is trustworthy (factual lookup, terms actually appear); low ⇒ synonym/paraphrase or
+  // OOV terms, where dense embeddings are needed. Drives the "coverage" fusion weight.
+  const cov = qTokens.length ? qTokens.filter((t) => store.bm25.df.has(t)).length / qTokens.length : 0;
   const cutoff = Date.now() - recentExcludeMs;
 
   // v0.9: split into in-project vs cross-project pools. Cross-project is scored
@@ -755,25 +762,43 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, poolSize, opts.hnswEf ?? 200));
   }
 
-  // v0.9: score a pool of unit indices → {raw scores, max}. Each pool is h-normalized
-  // INDEPENDENTLY so an in-project hit and a cross-project hit are each comparable to
-  // 1.0 *before* the federation penalty ranks cross-project down. (Previously the whole
-  // pool was one set normalized by a single hMax.)
-  const scorePool = (idx: number[]): { raw: Map<number, number>; max: number } => {
-    const raw = new Map<number, number>();
-    let max = 0;
+  // v0.9: score BOTH signals per pool — lexical (BM25) always, plus dense (cosine)
+  // when an embedder is loaded — so retrieve can HYBRID-fuse them. Each signal is
+  // normalized by its OWN per-pool max so in-project and cross-project hits are each
+  // comparable to 1.0 before the federation penalty, and lexical/dense share a scale.
+  const scorePool = (idx: number[]): { bm: Map<number, number>; bmMax: number; sem: Map<number, number>; semMax: number } => {
+    const bm = new Map<number, number>(), sem = new Map<number, number>();
+    let bmMax = 0, semMax = 0;
     for (const i of idx) {
       const u = store.units[i];
-      let s: number;
+      const b = store.bm25.score(qTokens, i); bm.set(i, b); if (b > bmMax) bmMax = b;
+      let s = 0;
       if (useEmb && qEmb && u.embedding && u.embedding.length) {
         s = (semCand && !semCand.has(i)) ? 0 : (cosine(qEmb, u.embedding) + 1) / 2; // cosine [-1,1] → [0,1]
-      } else {
-        s = store.bm25.score(qTokens, i); // word-overlap fallback
       }
-      raw.set(i, s);
-      if (s > max) max = s;
+      sem.set(i, s); if (s > semMax) semMax = s;
     }
-    return { raw, max };
+    return { bm, bmMax, sem, semMax };
+  };
+  // v0.9: hybrid fusion. v0.8 used dense-ALONE when an embedder was loaded (discarding
+  // BM25), which LoCoMo10 showed UNDERPERFORMS BM25 on real factual lookups (r@5 0.27
+  // vs 0.53) — and no naive fusion (max/weighted/RRF) beats BM25 there either, because
+  // per-signal normalization is degenerate and MiniLM is weak out-of-domain. The fix is
+  // a COVERAGE router: blend by how many query terms actually appear in the corpus, so
+  // BM25 carries factual lookups (high coverage) and dense rescues synonym/paraphrase
+  // queries whose terms are OOV (low coverage). hybrid:false restores v0.8 dense-only.
+  const hybrid = (opts.hybrid ?? true) && useEmb;
+  const fusion: "weighted" | "max" | "coverage" = opts.fusion ?? "coverage";
+  const semW = Math.min(1, Math.max(0, opts.semanticWeight ?? 0.5));
+  const lexW = 1 - semW;
+  type Pool = { bmMax: number; bm: Map<number, number>; semMax: number; sem: Map<number, number> };
+  const hOf = (pool: Pool, i: number): number => {
+    const bN = pool.bmMax ? (pool.bm.get(i) ?? 0) / pool.bmMax : 0;
+    if (!hybrid) return useEmb ? (pool.semMax ? (pool.sem.get(i) ?? 0) / pool.semMax : 0) : bN; // v0.8
+    const sN = pool.semMax ? (pool.sem.get(i) ?? 0) / pool.semMax : 0;
+    if (fusion === "max") return Math.max(bN, sN);
+    if (fusion === "coverage") return cov * bN + (1 - cov) * sN; // trust lexical when query terms match the corpus
+    return lexW * bN + semW * sN; // weighted
   };
   const minScore = opts.minScore ?? 0.15; // (hoisted from below; v0.9 federation needs it before the cross-project decision)
   const inPool = scorePool(inIdx);
@@ -789,7 +814,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   for (const v of gRaw.values()) if (v > gMax) gMax = v;
 
   type Cand = { idx: number; unit: TraceUnit; score: number; reason: string };
-  const hLabel = useEmb ? "semantics" : "lexical";
+  const hLabel = hybrid ? `hybrid:${fusion}` : (useEmb ? "semantics" : "lexical");
   const reasonFor = (g: number, h: number, cross = false) => {
     const base = g > 0 && h > 0 ? `graph+${hLabel}` : g > 0 ? "graph" : hLabel;
     return cross ? `${base}+cross-project` : base;
@@ -798,7 +823,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   for (const i of inIdx) {
     const u = store.units[i];
     const g = gMax ? (gRaw.get(u.id) ?? 0) / gMax : 0;
-    const h = inPool.max ? (inPool.raw.get(i) ?? 0) / inPool.max : 0;
+    const h = hOf(inPool, i);
     const score = wGraph * g + wHier * h;
     if (score <= 0) continue;
     cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h) });
@@ -815,7 +840,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     for (const i of outIdx) {
       const u = store.units[i];
       const g = gMax ? (gRaw.get(u.id) ?? 0) / gMax : 0;
-      const h = outPool.max ? (outPool.raw.get(i) ?? 0) / outPool.max : 0;
+      const h = hOf(outPool, i);
       const score = federatePenalty * (wGraph * g + wHier * h);
       if (score <= 0) continue;
       cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h, true) });
