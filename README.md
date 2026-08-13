@@ -81,17 +81,54 @@ Code-level constants (`index.ts`/`core.ts`): `rho` (routing weight), closure dis
 
 ## Performance
 
-Measured on a real ~240-unit store at a 94.77 tok/s prompt-eval rate (`bench.ts`):
+Measured live on a real 236-unit store (dim 384) at a 94.77 tok/s prompt-eval
+rate (`bench.ts`; **extension OFF ⇒ zero overhead** for every row):
 
-| | Before (v0.4) | After (v0.6) |
+**Store I/O** (amortized: load once/session, persist debounced per message)
+
+| | Legacy (inline floats) | Compact (v0.5: int8 sidecar) |
 |---|---|---|
-| Store on disk | ~2.1 MB | ~0.3 MB (**−84%**) |
-| Load (per session) | ~28 ms | ~3.7 ms (8.6× faster) |
-| Persist (debounced/msg) | ~65 ms | ~17 ms (3.8× faster) |
-| Tokens injected/turn | ~294 | ~112 (−182) |
-| Prefill added by injection | ~3.1 s | ~1.2 s (−1.9 s/turn) |
+| Store on disk | 2088 KB | 239 KB (json 147 + bin 93) — **−88%** |
+| Load | 45.2 ms | 8.7 ms (19% of legacy) |
+| Persist | 93.4 ms | 20.9 ms (22% of legacy) |
 
-HNSW recall@10 vs exact brute force: 90–96% at `ef=200` (dim 384); below 10k units brute force is faster, so HNSW stays dormant until it pays off.
+**Per-turn operations**
+
+| op | cost |
+|---|---|
+| capture (`add()` on `message_end`) | 0.04 ms |
+| retrieve (semantic, w/ query embed) | 5.1 ms |
+| retrieve (BM25-only fallback) | 1.3 ms |
+
+**Token injection** (v0.5 `topK5 × 220ch` → v0.6 `topK3 × 120ch`): header
+46→19 tok, body avg 249→103 tok → **~276 → ~103 tok/turn (−173)**.
+
+**Derived per-turn impact @ 94.77 tok/s**: injection prefill 2912 → 1087 ms
+(**−1825 ms/turn**); total per-turn overhead 2917 → 1092 ms, against ~20 s of
+base system-prompt + tools prefill.
+
+HNSW recall@10 vs exact brute force: 90–96% at `ef=200` (dim 384); below 10k
+units brute force is faster, so HNSW stays dormant until it pays off.
+
+## Eval — retrieval quality
+
+`eval.ts` is a deterministic, **zero-LLM** retrieval harness: 24 facts seeded
+across 3 sessions (+40 distractors), each with 1–2 paraphrase queries whose
+gold answer is that fact. Zero-Mem owns the *retrieval* step (the paper's
+headline is zero extra LLM calls); the reader is your model, so we measure
+recall@K / MRR + token cost rather than end-to-end F1/BLEU.
+
+| config | recall@3 | recall@5 | MRR | tok/turn |
+|---|---:|---:|---:|---:|
+| BM25 only (no embeddings) | 0.75 | 0.75 | 0.73 | 32 |
+| + semantic (MiniLM) | 0.94 | **0.96** | 0.94 | 113 |
+| + semantic + MMR | 0.94 | 0.96 | 0.94 | 113 |
+| FULL (+ co-occurrence bridges) | 0.94 | 0.96 | 0.94 | 113 |
+
+Headline: dense embeddings lift recall@5 **0.75 → 0.96**. MMR/bridges are
+recall-neutral here by design (MMR cuts redundancy; bridges only fire on shared
+entities, which this dataset deliberately lacks). True paper-style eval on
+LoCoMo/HotpotQA with an LLM reader is a v0.8 roadmap item.
 
 ## Tests
 
@@ -101,6 +138,7 @@ node --experimental-strip-types test-hnsw.ts       # HNSW recall vs brute, async
 node --experimental-strip-types test-mmr.ts        # MMR reduces pairwise redundancy (3/3)
 node --experimental-strip-types test-calibrate.ts  # fence/json/coverage/verbatim checks (8/8)
 node --experimental-strip-types test.ts            # v0.4 co-occurrence relational bridges
+node --experimental-strip-types test-recall.ts     # v0.8 session-scoped recent-exclusion (3/3)
 node --experimental-strip-types eval.ts            # retrieval eval: recall@K / MRR ablation
 node --experimental-strip-types bench.ts           # A/B benchmark (store I/O + token overhead)
 ```
@@ -110,8 +148,9 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
-**v0.7** — raw-trace memory, dense semantic embeddings, context-aware + co-occurrence-bridge
-retrieval, compact int8 storage with retention, slim + MMR-diversified per-request injection,
-async HNSW at scale, opt-in answer calibration, and a deterministic retrieval eval harness
-(semantic recall@5 0.96 vs BM25 0.75). Remaining work (true LoCoMo/LLM F1-BLEU eval, incremental
-HNSW, adaptive λ, cross-project federation) is documented in [`DESIGN.md`](./DESIGN.md).
+**v0.8** — everything in v0.7 plus **session-scoped recent-exclusion**: a fact the user just
+told the agent is now recallable immediately in a *new* session (previously dropped for 2 min
+across all sessions, so e.g. a name was unrecoverable in any conversation opened within 2 min).
+Retrieval eval is unchanged (semantic recall@5 0.96 vs BM25 0.75; see **Eval** above). Remaining
+work (true LoCoMo/LLM F1-BLEU eval, incremental HNSW, adaptive λ, cross-project federation) is
+documented in [`DESIGN.md`](./DESIGN.md).
