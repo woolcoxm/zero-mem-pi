@@ -673,13 +673,15 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     }
   }
 
-  // v0.6: at scale, restrict semantic search to HNSW candidates (exact cosine
-  // re-rank after). Below hnswThreshold, store.hnsw is null -> brute force over
-  // the whole pool (identical to v0.5 behaviour).
+  // v0.6/v0.7: at scale, restrict semantic search to HNSW candidates (exact cosine
+  // re-rank after); below hnswThreshold, store.hnsw is null -> brute force over the
+  // whole pool. Fetch a candidate pool (not just topK) so MMR has room to diversify.
+  const useMmr = opts.mmr !== false;
+  const poolSize = useMmr ? Math.max(topK * 4, topK + 10) : topK;
   let semCand: Set<number> | null = null;
   if (useEmb && (opts.useHnsw ?? true)) {
     store.buildHnswIfNeeded();
-    if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, topK, opts.hnswEf ?? 200));
+    if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, poolSize, opts.hnswEf ?? 200));
   }
 
   const hRaw = new Map<number, number>();
@@ -758,9 +760,8 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     .filter((c) => { if (seenFp.has(c.unit.fp)) return false; seenFp.add(c.unit.fp); return true; }); // v0.3: de-dup near-identical evidence
   // v0.7: MMR diversifies the injected set so top-K isn't several near-duplicate
   // snippets. Diversify from a pool larger than topK, then select topK.
-  const useMmr = opts.mmr !== false && ranked.length > topK;
-  const pool = useMmr ? ranked.slice(0, Math.max(topK * 4, topK + 10)) : ranked;
-  const picked = useMmr ? mmrSelect(pool, topK, opts.mmrLambda ?? 0.5) : pool;
+  const pool = ranked.slice(0, poolSize);
+  const picked = useMmr && pool.length > topK ? mmrSelect(pool, topK, opts.mmrLambda ?? 0.5) : pool;
   return picked.slice(0, topK).map((c) => ({ unit: c.unit, score: c.score, reason: c.reason }));
 }
 
