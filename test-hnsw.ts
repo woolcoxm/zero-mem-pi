@@ -60,7 +60,11 @@ const queryVec = parity[3];
 p.embedder = { ready: true, dim: DIM, init: async () => {}, embed: async () => queryVec } as any;
 p.ensureIndex();
 const off = (await retrieve("doc", p, { cwd, topK: 8, recentExcludeMs: 0, useHnsw: false })).map((h) => h.unit.id);
-p.hnsw = null; p.hnswThreshold = 2; // force build on next retrieve
+p.hnsw = null; p.hnswThreshold = 2; // force build
+const buildPromise = p.ensureHnsw();
+check(!!buildPromise && p.hnsw === null, "ensureHnsw is non-blocking (returns promise, hnsw still null mid-build)");
+await buildPromise;
+check(p.hnsw !== null, "background build completes and populates hnsw");
 const on = (await retrieve("doc", p, { cwd, topK: 8, recentExcludeMs: 0, useHnsw: true })).map((h) => h.unit.id);
 const overlap = on.filter((id) => off.includes(id)).length / Math.max(1, off.length);
 check(overlap >= 0.85, "retrieve() overlap: HNSW on vs off ≥ 0.85", `(${(overlap * 100).toFixed(0)}% of ${off.length} hits matched)`);
@@ -69,8 +73,8 @@ check(overlap >= 0.85, "retrieve() overlap: HNSW on vs off ≥ 0.85", `(${(overl
 const small = new MemoryStore("/tmp/zhnsw/small.json", makeExtractor(null));
 small.units = p.units.slice(); small.dirty = true; small.ensureIndex();
 small.hnswThreshold = 10000;
-small.buildHnswIfNeeded();
-check(small.hnsw === null, "below threshold: no HNSW built (exact brute force)", `(${small.units.length} units < ${small.hnswThreshold})`);
+const pr = small.ensureHnsw();
+check(small.hnsw === null && pr === null, "below threshold: no HNSW build scheduled (exact brute force)", `(${small.units.length} units < ${small.hnswThreshold})`);
 
 console.log("\n" + "=".repeat(70));
 console.log(`RESULTS: ${pass} passed, ${fail} failed`);

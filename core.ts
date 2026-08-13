@@ -344,6 +344,15 @@ export class HNSWIndex {
   }
   private dist(a: number[], b: number[]) { let dot = 0; for (let i = 0; i < a.length; i++) dot += a[i] * b[i]; return 1 - dot; }
   build(vectors: number[][]) { for (const v of vectors) this.insert(v); }
+  // v0.7: chunked build that yields to the event loop every `yieldEvery` inserts,
+  // so a large background build interleaves with pi's normal operation instead of
+  // blocking the turn for seconds.
+  async buildAsync(vectors: number[][], yieldEvery = 100) {
+    for (let i = 0; i < vectors.length; i++) {
+      this.insert(vectors[i]);
+      if (yieldEvery > 0 && (i + 1) % yieldEvery === 0) await new Promise((r) => setImmediate(r));
+    }
+  }
   private neighbors(lc: number, node: number): number[] { return this.layers[lc].get(node) ?? []; }
   private insert(q: number[]) {
     const id = this.data.length; this.data.push(q);
@@ -433,6 +442,8 @@ export class MemoryStore {
   hnswThreshold = 10000;            // v0.6: below this, exact brute force is faster AND exact (ZERO_MEM_HNSW_THRESHOLD)
   hnswEnabled = true;               // v0.6: ZERO_MEM_HNSW=0 disables
   private hnswBuiltFor = -1;        // v0.6: embedded-count the index was built for (growth-gated rebuild)
+  private hnswBuilding = false;     // v0.7: background build in progress
+  private hnswPromise: Promise<void> | null = null; // v0.7: awaited by tests
   extract: (text: string) => string[];
 
   constructor(path: string, extract: (t: string) => string[]) {
@@ -507,21 +518,35 @@ export class MemoryStore {
     }
     writeFileSync(this.embPath, buf);
   }
-  /** v0.6: build the HNSW index over embedded units when the store crosses
+  /** v0.6/v0.7: build the HNSW index over embedded units when the store crosses
    *  hnswThreshold; below it, leave null so retrieve() uses exact brute force
    *  (which is faster AND exact below ~10k units). Rebuild is growth-gated so a
-   *  per-message add() never triggers a multi-second rebuild — the index refreshes
-   *  only once embedded-count has grown ≥50% since the last build. */
-  buildHnswIfNeeded() {
-    if (!this.hnswEnabled) { this.hnsw = null; return; }
+   *  per-message add() never triggers a rebuild — the index refreshes only once
+   *  embedded-count has grown ≥50% since the last build. The build runs in the
+   *  BACKGROUND (chunked, event-loop-yielding) so a large rebuild never stalls a
+   *  turn; retrieve() falls back to exact brute force until the build finishes.
+   *  Returns the build promise (or null) so tests can await completion. */
+  ensureHnsw(): Promise<void> | null {
+    if (!this.hnswEnabled) { this.hnsw = null; return null; }
+    if (this.hnswBuilding) return this.hnswPromise;
     const idx: number[] = [];
     for (let i = 0; i < this.units.length; i++) if (this.units[i].embedding && this.units[i].embedding!.length) idx.push(i);
-    if (idx.length < this.hnswThreshold) { this.hnsw = null; return; }
-    if (this.hnsw && this.hnswBuiltFor > 0 && idx.length < this.hnswBuiltFor * 1.5) return; // growth-gated: skip until +50%
-    this.hnsw = new HNSWIndex({ M: 16, efConstruction: 200 });
-    this.hnsw.build(idx.map((i) => this.units[i].embedding!));
-    this.hnsw.unitIndex = idx;
-    this.hnswBuiltFor = idx.length;
+    if (idx.length < this.hnswThreshold) { this.hnsw = null; return null; }
+    if (this.hnsw && this.hnswBuiltFor > 0 && idx.length < this.hnswBuiltFor * 1.5) return null; // growth-gated: skip until +50%
+    const vectors = idx.map((i) => this.units[i].embedding!);
+    this.hnswBuilding = true;
+    this.hnswPromise = this.buildHnswInBackground(idx, vectors);
+    return this.hnswPromise;
+  }
+  private async buildHnswInBackground(idx: number[], vectors: number[][]) {
+    try {
+      const h = new HNSWIndex({ M: 16, efConstruction: 200 });
+      await h.buildAsync(vectors); // chunked + yields; does not block the turn
+      h.unitIndex = idx;
+      this.hnsw = h;
+      this.hnswBuiltFor = idx.length;
+    } catch (e) { console.error("[zero-mem] HNSW build failed:", e); }
+    finally { this.hnswBuilding = false; this.hnswPromise = null; }
   }
   /** v0.5: bound store growth — drop units older than maxAgeMs, then trim to maxUnits. */
   enforceRetention() {
@@ -680,7 +705,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   const poolSize = useMmr ? Math.max(topK * 4, topK + 10) : topK;
   let semCand: Set<number> | null = null;
   if (useEmb && (opts.useHnsw ?? true)) {
-    store.buildHnswIfNeeded();
+    store.ensureHnsw(); // non-blocking; starts/continues a background build if needed
     if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, poolSize, opts.hnswEf ?? 200));
   }
 
