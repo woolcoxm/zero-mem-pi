@@ -128,7 +128,7 @@ recall@K / MRR + token cost rather than end-to-end F1/BLEU.
 Headline: dense embeddings lift recall@5 **0.75 → 0.96**. MMR/bridges are
 recall-neutral here by design (MMR cuts redundancy; bridges only fire on shared
 entities, which this dataset deliberately lacks). True paper-style eval on
-LoCoMo/HotpotQA with an LLM reader is a v0.8 roadmap item.
+LoCoMo/HotpotQA with an LLM reader is a v0.9 roadmap item.
 
 ## Tests
 
