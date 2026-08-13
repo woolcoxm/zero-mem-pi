@@ -39,13 +39,34 @@ For permanent auto-load (hot-reloadable via `/reload`), copy/symlink the folder 
 
 ## How it works (in pi)
 
-- Every finalized message is captured as a **trace unit** with provenance (session, project, time) + extracted entities, then embedded with `all-MiniLM-L6-v2`.
+- Every finalized message is captured as a **trace unit** with provenance (session, project, time) + extracted entities, then embedded with `bge-small-en-v1.5` (v0.10; was MiniLM).
 - On each prompt, a **zero-LLM pipeline** routes between two views (entity–context graph vs. semantic/temporal), fuses them, runs evidence closure, and injects up to **3** snippets (default) as a `## Prior session memory` block in the system prompt.
 - Memory is **project-scoped** by default and persisted to `~/.pi/agent/zero-mem/`:
   - `store.json` — text + metadata only (small, human-readable).
   - `store.emb.bin` — embeddings, **int8-quantized** in a compact sidecar (v0.5). The full-precision JSON era is gone; a one-shot `migrate.ts` converts legacy stores automatically on first load.
 - A **retention policy** bounds growth (drop units older than `maxAgeMs`; trim to `maxUnits`).
 - Above ~10k embedded units, retrieval switches from exact brute-force cosine to a **pure-JS HNSW** index (growth-gated rebuild, so it never stalls a turn).
+
+## How it compares
+
+Zero-Mem's defining property is **zero-token memory operations**: capture is
+passive (every message) and retrieval is deterministic encoder + index math —
+the LLM is **never** called to decide what to remember, summarize, or forget.
+The only tokens spent on memory are the injected snippet (~103/turn).
+
+| | Plain RAG (vector DB) | MemGPT / LLM-managed | **Zero-Mem** |
+|---|---|---|---|
+| Decide what to remember | no | **LLM calls** | automatic, no LLM |
+| Retrieval | cosine only | varies | BM25 + dense + entity graph + temporal, fused |
+| Summarize / forget | no | **LLM calls** | deterministic retention policy |
+| Tokens spent on memory mgmt | retrieval tokens | **many** (LLM babysits its own memory) | **zero** — encoder math only |
+
+So vs. a bare vector store it's richer (co-occurrence graph bridges, temporal
+hierarchy, hybrid retrieval — not just cosine); vs. MemGPT-style systems it's far
+cheaper (they burn LLM generations managing memory). The honest trade-off:
+retrieval quality is **competitive, not SOTA** — on real data it **ties BM25**
+(LoCoMo r@5 0.534 vs 0.529) and beats it on paraphrase (0.92 vs 0.75). The win
+is the zero-token property + the structured pipeline, not raw retrieval dominance.
 
 ## Commands
 
@@ -154,9 +175,12 @@ the query's lexical coverage, so BM25 carries factual lookups (high coverage)
 while dense rescues synonym/paraphrase queries whose terms are OOV (low
 coverage). Result: **0.534 (≥ BM25) on LoCoMo** *and* **0.92 on the paraphrase
 eval** (vs BM25's 0.75) — best-of-both, no regressions. For the paper's actual
-metric — end-to-end answer F1/EM/BLEU with an LLM reader — see `eval-reader.ts`
-(runs the moment an OpenAI-compatible endpoint is up; falls back to retrieval
-hit-rate otherwise). Embeddings are bit-exact deterministic across runs.
+metric — end-to-end answer F1/EM/BLEU with an LLM reader — `eval-reader.ts`
+runs it: on a 50-QA LoCoMo sample with a local Qwen3-Coder reader (temp 0),
+**answer F1 0.155 / EM 0.040 / BLEU-1 0.177** (retrieval hit@5 0.30 on that
+sample). That's a strict RAG setup (top-5 snippets + session dates only), so
+it's a lower bound — the LoCoMo paper itself reports models "lag behind human
+performance." Embeddings are bit-exact deterministic across runs.
 
 ## Tests
 

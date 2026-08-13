@@ -26,7 +26,7 @@ const TOPK = Number(process.argv[5] ?? 5);
 const CACHE = "C:/Users/Robot/projects/zero-mem-pi/.locomo10.json";
 
 // ── SQuAD-style scoring (deterministic) ─────────────────────────────────────
-const norm = (s: string) => s.toLowerCase().replace(/\b(a|an|the)\b/g, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+const norm = (s: any) => String(s ?? "").toLowerCase().replace(/\b(a|an|the)\b/g, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
 const toks = (s: string) => norm(s).split(" ").filter(Boolean);
 function f1(pred: string, gold: string) {
   const p = toks(pred), g = toks(gold);
@@ -60,19 +60,20 @@ async function llmAnswer(ep: string, model: string, context: string, question: s
 // ── LoCoMo data + stores (reuse eval-locomo shape) ──────────────────────────
 const extract = makeExtractor(null);
 const data: any[] = JSON.parse(readFileSync(CACHE, "utf8"));
+const dateOfSession = (conv: any, n: number) => { const dt: string = conv[`session_${n}_date_time`] ?? ""; return dt.includes(" on ") ? dt.split(" on ")[1] : dt; };
 const uttsOf = (conv: any) => {
   const sess = Object.keys(conv).filter((k) => /^session_\d+$/.test(k)).sort((a, b) => +a.split("_")[1] - +b.split("_")[1]);
-  const out: { dia_id: string; text: string }[] = [];
-  for (const sk of sess) for (const t of conv[sk]) if (t && t.text) out.push({ dia_id: t.dia_id, text: t.text });
+  const out: { dia_id: string; text: string; date: string }[] = [];
+  for (const sk of sess) { const n = +sk.split("_")[1]; const date = dateOfSession(conv, n); for (const t of conv[sk]) if (t && t.text) out.push({ dia_id: t.dia_id, text: t.text, date }); }
   return out;
 };
-function buildStore(utts: { dia_id: string; text: string }[], embedder: Embedder) {
+function buildStore(utts: { dia_id: string; text: string; date: string }[], embedder: Embedder) {
   const path = `${CACHE}.rd-${Math.random().toString(36).slice(2)}.json`;
   const s = new MemoryStore(path, extract); s.embedder = embedder;
-  const dia = new Map<string, string>(); let i = 0;
-  for (const u of utts) { const unit = s.add({ sessionId: "locomo", cwd: "C:/locomo", role: "user", text: u.text, timestamp: Date.now() + i++ }); dia.set(unit.id, u.dia_id); }
+  const dia = new Map<string, string>(), dateOf = new Map<string, string>(); let i = 0;
+  for (const u of utts) { const unit = s.add({ sessionId: "locomo", cwd: "C:/locomo", role: "user", text: u.text, timestamp: Date.now() + i++ }); dia.set(unit.id, u.dia_id); dateOf.set(unit.id, u.date); }
   s.ensureIndex();
-  return { store: s, dia };
+  return { store: s, dia, dateOf };
 }
 
 // round-robin sample across the 10 conversations for category variety
@@ -94,7 +95,7 @@ console.log(`[reader] endpoint ${ENDPOINT} ${up ? `UP (model: ${model})` : "DOWN
 console.log(`[reader] ${sampled.length} QA sampled (round-robin), topK=${TOPK}\n`);
 
 // build + embed stores only for touched conversations
-const storeCache = new Map<number, { store: MemoryStore; dia: Map<string, string> }>();
+const storeCache = new Map<number, { store: MemoryStore; dia: Map<string, string>; dateOf: Map<string, string> }>();
 const getStore = async (ci: number) => {
   if (!storeCache.has(ci)) { const s = buildStore(uttsOf(data[ci].conversation), embedder); await s.store.embedAll(); storeCache.set(ci, s); }
   return storeCache.get(ci)!;
@@ -108,13 +109,13 @@ const cat = (c: number) => { if (!byCat.has(c)) byCat.set(c, { f1: 0, em: 0, ble
 const R = { cwd: "C:/locomo", sessionId: "reader", scopeToProject: false, topK: TOPK, minScore: 0, mmr: false, useHnsw: false, hybrid: true, fusion: "coverage" as const };
 for (let s = 0; s < sampled.length; s++) {
   const { ci, q } = sampled[s];
-  const { store, dia } = await getStore(ci);
-  const hits = await retrieve(q.question, store, R);
-  const gold = new Set<string>(q.evidence ?? []);
-  const hit = hits.some((h) => gold.has(dia.get(h.unit.id) ?? "")) ? 1 : 0;
-  const a = acc, ca = cat(q.category); a.n++; ca.n++; a.hit += hit; ca.hit += hit;
-  if (up) {
-    const context = formatEvidence(hits, 200);
+    const { store, dia, dateOf } = await getStore(ci);
+    const hits = await retrieve(q.question, store, R);
+    const gold = new Set<string>(q.evidence ?? []);
+    const hit = hits.some((h) => gold.has(dia.get(h.unit.id) ?? "")) ? 1 : 0;
+    const a = acc, ca = cat(q.category); a.n++; ca.n++; a.hit += hit; ca.hit += hit;
+    if (up) {
+      const context = hits.map((h) => `[${dateOf.get(h.unit.id) ?? ""}] ${h.unit.text.slice(0, 200)}`).join("\n");
     let pred = ""; try { pred = await llmAnswer(ENDPOINT, model, context, q.question); } catch (e: any) { pred = `__err:${(e?.message ?? "").slice(0, 40)}`; }
     const f = f1(pred, q.answer ?? ""), e = em(pred, q.answer ?? ""), b = bleu1(pred, q.answer ?? "");
     a.f1 += f; a.em += e; a.bleu += b; ca.f1 += f; ca.em += e; ca.bleu += b;
