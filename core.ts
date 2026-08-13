@@ -443,6 +443,7 @@ export class MemoryStore {
       if (existsSync(this.path)) {
         const raw = JSON.parse(readFileSync(this.path, "utf8"));
         this.units = Array.isArray(raw?.units) ? raw.units : [];
+        for (const u of this.units) if (!u.tokens || !u.tokens.length) u.tokens = tokenize(u.text); // v0.7: tokens not persisted; recompute from text
         this.scopeToProject = raw?.scopeToProject ?? true;
         this.counter = raw?.counter ?? this.units.length;
       }
@@ -575,7 +576,8 @@ export class MemoryStore {
       mkdirSync(join(this.path, ".."), { recursive: true });
       // v0.5: store.json stays text-only (small, human-readable); embeddings are
       // quantized to int8 in the .bin sidecar (~21x smaller than inline JSON).
-      const stubs = this.units.map((u) => ({ ...u, embedding: null }));
+      // v0.7: tokens are NOT persisted (recomputed from text on load) to shrink the JSON further.
+      const stubs = this.units.map((u) => { const { tokens, embedding, ...rest } = u; return rest; });
       writeFileSync(this.path, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter }));
       this.writeEmbeddings(this.units);
     } catch (e) { console.error("[zero-mem] failed to persist:", e); }

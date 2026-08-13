@@ -55,6 +55,8 @@ for (let i = 0; i < N; i++) {
   truth.set(unit.id, emb);
 }
 await store.persist();
+const rawJson = JSON.parse(readFileSync(storePath, "utf8"));
+check(!rawJson.units.some((u: any) => "tokens" in u), "store.json units omit the tokens key (v0.7, recomputed on load)");
 const binKB = statSync(embPath).size / 1024;
 const jsonKB = statSync(storePath).size / 1024;
 const inlineEstKB = (N * DIM * 21) / 1024;
@@ -114,9 +116,9 @@ lm.load();
 const hadInline = lm.units.every((u) => Array.isArray(u.embedding) && u.embedding!.length === DIM);
 await lm.persist();
 const reJson = JSON.parse(readFileSync(lpath, "utf8"));
-const stripped = reJson.units.every((u: any) => u.embedding === null);
+const stripped = !reJson.units.some((u: any) => Array.isArray(u.embedding));
 check(hadInline && existsSync(lemb) && stripped, "legacy store migrated cleanly",
-  `(inline@load=${hadInline}, sidecar@persist=${existsSync(lemb)}, json stripped=${stripped})`);
+  `(inline@load=${hadInline}, sidecar@persist=${existsSync(lemb)}, inline-stripped=${stripped})`);
 
 console.log("\n" + "=".repeat(70));
 console.log(`RESULTS: ${pass} passed, ${fail} failed`);
