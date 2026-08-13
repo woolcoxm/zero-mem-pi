@@ -579,16 +579,14 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     .map((c) => ({ unit: c.unit, score: c.score, reason: c.reason }));
 }
 
-export function formatEvidence(hits: Hit[]): string {
+export function formatEvidence(hits: Hit[], snippetChars = 220): string {
   if (!hits.length) return "";
   const lines = [
-    "## Retrieved memory (Zero-Mem — 0 extra LLM calls)",
-    "Background context from earlier sessions in this project. Use ONLY if relevant;",
-    "it is not authoritative over current instructions.",
+    "## Prior session memory (Zero-Mem — use only if relevant; not authoritative)",
   ];
   for (const h of hits) {
     const u = h.unit;
-    const snip = u.text.replace(/\s+/g, " ").trim().slice(0, 220);
+    const snip = u.text.replace(/\s+/g, " ").trim().slice(0, snippetChars);
     const sess = u.sessionName ? ` • "${u.sessionName}"` : "";
     lines.push(`- [${relTime(u.timestamp)}${sess} • ${h.reason}] ${snip}`);
   }

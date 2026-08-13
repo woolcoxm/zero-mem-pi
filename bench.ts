@@ -78,29 +78,34 @@ console.log(`  capture   add() per message_end : ${captureT.toFixed(2)} ms`);
 console.log(`  retrieve  semantic (w/ embedder): ${semT.toFixed(2)} ms /turn   [includes query embed + search]`);
 console.log(`  retrieve  BM25-only (fallback)  : ${bm25T.toFixed(2)} ms /turn`);
 
-// ── Part C: token injection overhead ──────────────────────────────────────────
-console.log("\nPART C — Token injection overhead (the only thing that grows your prompt)");
-const header = "## Retrieved memory (Zero-Mem — 0 extra LLM calls)\nBackground context from earlier sessions in this project. Use ONLY if relevant;\nit is not authoritative over current instructions.";
-console.log(`  fixed header: ${tokEst(header)} tokens (every turn, regardless of hits)`);
-let sumInj = 0;
+// ── Part C: token injection overhead — BEFORE (v0.5) vs AFTER (v0.6 slim) ───────
+console.log("\nPART C — Token injection: BEFORE (v0.5: topK5 × 220ch) vs AFTER (v0.6: topK3 × 120ch)");
+const oldHeader = "## Retrieved memory (Zero-Mem — 0 extra LLM calls)\nBackground context from earlier sessions in this project. Use ONLY if relevant;\nit is not authoritative over current instructions.";
+const newHeader = "## Prior session memory (Zero-Mem — use only if relevant; not authoritative)";
+const headerSave = tokEst(oldHeader) - tokEst(newHeader);
+console.log(`  header: ${tokEst(oldHeader)} → ${tokEst(newHeader)} tokens (saves ${headerSave}/turn)`);
+let sumBefore = 0, sumAfter = 0;
 for (const q of queries) {
-  const hits = await retrieve(q, repStore, { cwd, topK: 5, recentExcludeMs: 0 });
-  const inj = formatEvidence(hits);
-  const toks = tokEst(inj);
-  sumInj += toks;
-  console.log(`  "${q}" → ${hits.length} hits, ${toks} tokens injected`);
+  const all = (await retrieve(q, repStore, { cwd, topK: 8, recentExcludeMs: 0 }));
+  const before = formatEvidence(all.slice(0, 5), 220);
+  const after = formatEvidence(all.slice(0, 3), 120);
+  const tb = tokEst(before), ta = tokEst(after);
+  sumBefore += tb; sumAfter += ta;
+  console.log(`  "${q}" → ${tb} → ${ta} tok`);
 }
-const avgInj = Math.round(sumInj / queries.length);
-console.log(`  average injection: ~${avgInj} tokens/turn (extension OFF ⇒ 0)`);
+const avgBefore = Math.round(sumBefore / queries.length);
+const avgAfter = Math.round(sumAfter / queries.length);
+const totalBefore = avgBefore + headerSave, totalAfter = avgAfter; // before also paid the bigger header
+console.log(`  avg body: ${avgBefore} → ${avgAfter} tok; with header: ${totalBefore} → ${totalAfter} tok/turn`);
+console.log(`  v0.6 saves ~${totalBefore - totalAfter} tokens/turn (extension OFF ⇒ 0)`);
 
 // ── Part D: derived A/B at your measured prefill rate ─────────────────────────
-console.log("\nPART D — Derived end-to-end impact @ " + PREFILL_TPS + " tok/s prompt-eval");
+console.log("\nPART D — Derived per-turn impact @ " + PREFILL_TPS + " tok/s prompt-eval");
 const wallPerTurn = semT; // retrieve runs every before_agent_start
-const prefillAdded = avgInj / PREFILL_TPS * 1000;
-console.log(`  retrieval wall-clock added before model starts : ${wallPerTurn.toFixed(0)} ms`);
-console.log(`  prefill time added by injection (~${avgInj} tok) : ${prefillAdded.toFixed(0)} ms`);
-console.log(`  total per-turn overhead of running Zero-Mem    : ${(wallPerTurn + prefillAdded).toFixed(0)} ms`);
+const prefillBefore = totalBefore / PREFILL_TPS * 1000;
+const prefillAfter = totalAfter / PREFILL_TPS * 1000;
+console.log(`  retrieval wall-clock                       : ${wallPerTurn.toFixed(0)} ms`);
+console.log(`  prefill from injection: ${prefillBefore.toFixed(0)} → ${prefillAfter.toFixed(0)} ms  (saves ${(prefillBefore - prefillAfter).toFixed(0)} ms/turn)`);
+console.log(`  total per-turn overhead: ${(wallPerTurn + prefillBefore).toFixed(0)} → ${(wallPerTurn + prefillAfter).toFixed(0)} ms`);
 console.log(`  (vs ~${Math.round(1909 / PREFILL_TPS * 1000)} ms base prefill for the ~1.9k-token system prompt + tools)`);
-console.log(`  NOTE: per-turn overhead is IDENTICAL for v0.4 and v0.5 — the int8 migration`);
-console.log(`  fixed store bloat + I/O, NOT per-request tokens.`);
 console.log("=".repeat(72));

@@ -22,6 +22,9 @@ export default async function (pi: ExtensionAPI) {
   const store = new MemoryStore(storePath, extract);
   if (process.env.ZERO_MEM_MAX_UNITS) store.maxUnits = Number(process.env.ZERO_MEM_MAX_UNITS) || store.maxUnits; // v0.5 retention
   if (process.env.ZERO_MEM_MAX_AGE_DAYS) store.maxAgeMs = (Number(process.env.ZERO_MEM_MAX_AGE_DAYS) || 0) * 24 * 3600 * 1000; // v0.5
+  // v0.6: slimmer per-request injection (the latency lever on slow local models).
+  const injectTopK = Math.max(1, Number(process.env.ZERO_MEM_INJECT_TOPK ?? 3));
+  const injectSnippet = Math.max(40, Number(process.env.ZERO_MEM_INJECT_SNIPPET ?? 120));
   store.embedder = new Embedder(); // v0.2; loads lazily on first retrieve
   let loaded = false;
   const ensureLoaded = async () => { if (!loaded) { store.load(); loaded = true; } };
@@ -64,9 +67,9 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
-      const hits = await retrieve(query, store, { cwd: ctx.cwd, scopeToProject: store.scopeToProject, topK: 5, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(query, store, { cwd: ctx.cwd, scopeToProject: store.scopeToProject, topK: injectTopK, activeContext: activeContextFingerprints(ctx) });
       if (!hits.length) return;
-      return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits) };
+      return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
     } catch (e) { console.error("[zero-mem] before_agent_start error:", e); }
   });
 
