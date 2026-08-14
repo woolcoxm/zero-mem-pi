@@ -40,7 +40,7 @@ For permanent auto-load (hot-reloadable via `/reload`), copy/symlink the folder 
 ## How it works (in pi)
 
 - Every finalized message is captured as a **trace unit** with provenance (session, project, time) + extracted entities, then embedded with `bge-small-en-v1.5` (v0.10; was MiniLM).
-- On each prompt, a **zero-LLM pipeline** routes between two views (entity–context graph vs. semantic/temporal), fuses them, runs evidence closure, and injects up to **3** snippets (default) as a `## Prior session memory` block in the system prompt.
+- On each prompt, a **zero-LLM pipeline** routes between two views — the entity–context graph scored by **Personalized PageRank** (v0.14, paper Eq 8–10) vs. the semantic/temporal view — fuses them (primary view gets ρ), runs evidence closure, and injects up to **3** snippets (default) as a `## Prior session memory` block in the system prompt.
 - Memory is **project-scoped** by default and persisted to `~/.pi/agent/zero-mem/`:
   - `store.json` — text + metadata only (small, human-readable).
   - `store.emb.bin` — embeddings, **int8-quantized** in a compact sidecar (v0.5). The full-precision JSON era is gone; a one-shot `migrate.ts` converts legacy stores automatically on first load.
@@ -65,7 +65,7 @@ So vs. a bare vector store it's richer (co-occurrence graph bridges, temporal
 hierarchy, hybrid retrieval — not just cosine); vs. MemGPT-style systems it's far
 cheaper (they burn LLM generations managing memory). The honest trade-off:
 retrieval quality is **competitive, not SOTA** — on real data it **ties BM25**
-(LoCoMo r@5 0.543 vs 0.529) and beats it on paraphrase (0.98 vs 0.75). The win
+(LoCoMo r@5 0.543 vs 0.529) and beats it on paraphrase (0.96 vs 0.75). The win
 is the zero-token property + the structured pipeline, not raw retrieval dominance.
 
 ## Commands
@@ -149,11 +149,24 @@ recall@K / MRR + token cost rather than end-to-end F1/BLEU.
 
 | config | recall@3 | recall@5 | MRR | tok/turn |
 |---|---:|---:|---:|---:|
-| BM25 only (no embeddings) | 0.75 | 0.75 | 0.73 | 32 |
-| coverage fusion (v0.11: min-max + calibration) | 0.96 | **0.98** | 0.90 | 63 |
+| BM25 only (no embeddings) | 0.75 | 0.75 | 0.74 | 34 |
+| coverage fusion + PPR (v0.14b) | 0.96 | **0.96** | 0.90 | 79 |
 
-Headline: the **coverage router** lifts recall@5 **0.75 → 0.98** over BM25 on
-synonym/paraphrase queries (v0.11's min-max normalization lifted it 0.92 → 0.98).
+**Honest caveat**: this dataset is easy (hand-written facts vs trivially
+separable distractors). The tougher **hard-negative eval** (`eval-hard.ts`,
+v0.14) generates 200 facts where each has a *sibling differing in exactly one
+value* (staging vs production, port A vs B) and 2 paraphrase queries each —
+near-duplicate collisions, not toy distractors:
+
+| config | recall@5 | MRR |
+|---|---:|---:|
+| BM25 only | 0.652 | 0.364 |
+| coverage fusion + PPR | **0.695** | 0.378 |
+
+Headline: the **coverage router** lifts recall@5 **0.75 → 0.96** over BM25 on
+synonym/paraphrase queries (v0.11's min-max lifted it to 0.98; v0.14b weak-pool
+gating costs one weak query — 0.96 — in exchange for not injecting garbage on
+unanswerable prompts).
 (This dataset stresses semantic matching; the v0.8 dense-only path scored 0.96
 here, but see LoCoMo below for why that default was wrong for real data.)
 
@@ -166,41 +179,57 @@ utterance (by `dia_id`) lands in the top-K.
 
 | config | recall@5 | MRR |
 |---|---:|---:|
-| BM25 only | 0.529 | 0.393 |
+| BM25 only | 0.535 | 0.399 |
 | pure semantic (MiniLM, v0.8 default) | 0.273 | 0.183 |
-| RRF hybrid (k=60) | 0.503 | 0.323 |
-| **coverage fusion (v0.11: min-max + calibration)** | **0.543** | **0.404** |
+| pure semantic (bge-small, v0.10+) | 0.427 | 0.296 |
+| RRF hybrid (k=60) | 0.552 | 0.384 |
+| **coverage fusion + PPR graph (v0.14)** | **0.546** | **0.404** |
+| coverage fusion, closure off (v0.13 ablation) | 0.546 | 0.403 |
 
-On real conversational factual lookups, **BM25 beats MiniLM** (0.529 vs 0.273),
-and no naive fusion (max/weighted/RRF) recovers it — the dense model is weak
+(v0.14 re-run with PPR graph scoring + paper routing.) On real conversational
+factual lookups, **BM25 beats pure dense** (0.535 vs 0.427 bge / 0.273 MiniLM),
+and no naive fusion (max/weighted) recovers it — the dense model is weak
 out-of-domain. The **coverage router** fixes it: blend BM25 + dense by the
 query's lexical coverage, so BM25 carries factual lookups (high coverage) while
-dense rescues synonym/paraphrase queries whose terms are OOV (low coverage).
-v0.11 added the paper's **min-max normalization** (Eq 12 — stretches dense
-cosines from [0.5,1] to [0,1]) and **evidence calibration** (Eq 15 — answer-type
-compatibility re-rank). Result: **0.543 (≥ BM25) on LoCoMo** *and* **0.98 on the
+dense rescues synonym/paraphrase queries whose terms are OOV (low coverage),
+on top of v0.11's **min-max normalization** (Eq 12) and **evidence calibration**
+(Eq 15) and v0.14's **PPR graph** (Eq 8–10). A **paired McNemar test**: CORE vs
+BM25 @5 has 31 CORE-only hits vs 9 BM25-only hits, **p ≈ 0.0009** — the margin
+is real, not noise. The **held-out split** (convs 1–5 carried the historical
+tuning decisions; 6–10 never did) shows the honest margin: CORE beats BM25 by
++0.015 on the tuned half but **+0.007 on the held-out half (0.531 vs 0.524)** —
+i.e. the coverage fusion genuinely generalizes, with roughly half the headline
+gap attributable to tuned-on-test bias. Result: **0.546 (> BM25, significant)**
+on LoCoMo *and* **0.96 on the
 paraphrase eval** (vs BM25's 0.75) — best-of-both, no regressions. For the
 paper's actual metric — end-to-end answer F1/EM/BLEU with an LLM reader —
 `eval-reader.ts` runs it: on a 50-QA LoCoMo sample (top-10 context + session
 dates, Qwen3-Coder reader, temp 0), **answer F1 0.200 / EM 0.040 / BLEU-1
-0.224** (retrieval hit@10 0.40; was F1 0.155 at top-5). It's a strict RAG setup
+0.224** (retrieval hit@10 0.40; was F1 0.155 at top-5). **Scale note: these are 0–1;
+the papers report ×100 (i.e. F1 20.0 vs Zero-Mem's 59.15 with a GPT-4o-mini reader)** —
+and the reader, prompt protocol, and sample differ, so treat it as a lower bound, not a
+comparable number. It's a strict RAG setup
 so it's a lower bound — the LoCoMo paper itself reports models "lag behind human
 performance." Embeddings are bit-exact deterministic across runs.
 
 ## Tests
 
 ```bash
+npm test                                             # runs everything below, one command
 node --experimental-strip-types test-storage.ts    # int8 round-trip, size, retention, migration (7/7)
 node --experimental-strip-types test-hnsw.ts       # HNSW recall vs brute, async build, threshold guard (5/5)
 node --experimental-strip-types test-mmr.ts        # MMR reduces pairwise redundancy (3/3)
 node --experimental-strip-types test-calibrate.ts  # fence/json/coverage/verbatim checks (8/8)
-node --experimental-strip-types test.ts            # v0.4 co-occurrence relational bridges
+node --experimental-strip-types test.ts            # graph thread (bridges+closures) surfaces co-occurring context (3/3)
 node --experimental-strip-types test-recall.ts     # v0.8 session-scoped recent-exclusion (3/3)
 node --experimental-strip-types test-federation.ts # v0.9 cross-project federation (5/5)
 node --experimental-strip-types test-adaptive.ts   # v0.9 adaptive MMR lambda (5/5)
 node --experimental-strip-types test-incremental.ts # v0.9 HNSW incremental insert (7/7)
-node --experimental-strip-types eval.ts            # retrieval eval: recall@K / MRR ablation
-node --experimental-strip-types eval-locomo.ts     # retrieval eval on real LoCoMo10 (caches ~2.8MB dataset)
+node --experimental-strip-types test-fixes.ts      # v0.13 audit-fix regression suite (26/26)
+node --experimental-strip-types test-relevance.ts  # v0.14b weak-pool gating + name-perspective (4/4)
+node --experimental-strip-types eval.ts            # retrieval eval: easy-paraphrase ablation (historical)
+node --experimental-strip-types eval-hard.ts       # 200-fact hard-negative paraphrase eval (v0.14)
+node --experimental-strip-types eval-locomo.ts     # retrieval eval on real LoCoMo10, with held-out split (caches ~2.8MB dataset)
 node --experimental-strip-types eval-reader.ts      # END-TO-END: LLM-reader F1/EM/BLEU on LoCoMo (falls back to hit-rate w/o endpoint)
 node --experimental-strip-types bench.ts           # A/B benchmark (store I/O + token overhead)
 ```
@@ -209,6 +238,42 @@ Requires Node ≥ 22 (for `--experimental-strip-types`). The live MiniLM embedde
 loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB).
 
 ## Status
+
+**v0.14b** — live-bug fix: the "what is your name?" confusion. Weak retrieval pools
+(one matching term) were min-max-normalized into confident-looking garbage injections;
+now every pool carries a confidence (BM25 raw strength / dense cosine anchors) and
+weak pools inject **nothing** — "no memory" beats "confusing memory". Added
+**perspective compatibility** ("my name" vs "your name" queries are indistinguishable
+to BM25/embeddings — cos 0.71 vs 0.74 — but who speaks about whom discriminates), and
+robust session-id / active-context extraction across pi API shapes (both recency guards
+could silently miss, injecting seconds-old same-session chatter). Reproduced exactly in
+`test-relevance.ts`; 11 files / 71 assertions green; hard-negative eval unchanged
+(0.695); LoCoMo unchanged (0.546, p≈0.0009, same held-out split).
+
+**v0.14** — paper-fidelity release. The graph view now implements the paper's
+**Personalized PageRank propagation** (Eq 8–10: idf-weighted shared-entity unit
+graph, query reset vector seeded by direct matches + *embedding-cosine* entity
+matching, π ← (1−γ)r + γPᵀπ at γ=0.6) — replacing the count-based bridges — and
+**routing** now follows Eq 6–7/13 exactly (relational queries run graph-primary,
+temporal run hierarchy-primary; primary gets ρ=0.6). Validated on LoCoMo:
+r@5 **0.543 → 0.546**, McNemar p ≈ 0.0009 vs BM25, no regressions elsewhere.
+Evals got honest: held-out conversation split reported (tuned 1–5 vs untouched
+6–10), and a new 200-fact hard-negative paraphrase eval (`eval-hard.ts`) where
+every fact has a one-value-different sibling (FULL 0.695 vs BM25 0.652).
+
+**v0.13** — audit-hardening release. A full review (code + evals, paper-fidelity check
+against arXiv:2607.29377) surfaced and fixed a cluster of *lifecycle* defects that could
+silently corrupt or lose memory: HNSW indices going stale after retention trims
+(wrong-unit results at scale), non-atomic persist plus a corrupt-load path that could
+wipe the store, concurrent pi sessions overwriting each other's captures (now merged by
+id on persist), the activeContext fingerprint mismatch that re-injected long tool
+output, and a dead-candidate rule that blocked evidence closure. Also: strict env-var
+parsing (a NaN `ZERO_MEM_MMR_LAMBDA` used to silently disable MMR), prompt-injection
+hygiene for injected snippets, `migrate.ts` preserving the embedder stamp, bounded
+first-turn embedding, and eval honesty fixes (LoCoMo closure ablation + McNemar
+significance for the CORE-vs-BM25 margin; eval-reader's ×100 scale label and seeded
+random sampling). All validated: 10 test files / 67 assertions green (26 new regression
+tests), paraphrase eval unchanged at 0.98. See v0.13 in [`DESIGN.md`](./DESIGN.md).
 
 **v0.11** — everything in v0.10 plus three **paper-fidelity fixes** (vs arXiv:2607.29377):
 **min-max per-view normalization** (Eq 12), **evidence calibration** (Eq 15 —

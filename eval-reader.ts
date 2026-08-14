@@ -76,15 +76,18 @@ function buildStore(utts: { dia_id: string; text: string; date: string }[], embe
   return { store: s, dia, dateOf };
 }
 
-// round-robin sample across the 10 conversations for category variety
+// v0.13: SEEDED RANDOM sample across all 1986 QA (mulberry32, fixed seed) —
+// round-robin-first-per-conversation sampled in dataset order, which may cluster
+// by category/difficulty. Random sampling makes the sample representative and
+// reproducible.
 const sampled: { ci: number; q: any }[] = [];
-const qsByConv = data.map((c) => c.qa as any[]);
-let idx = 0;
-while (sampled.length < SAMPLE_N && qsByConv.some((q) => q.length)) {
-  for (let ci = 0; ci < qsByConv.length && sampled.length < SAMPLE_N; ci++) {
-    const q = qsByConv[ci].shift(); if (q) sampled.push({ ci, q });
-  }
-  if (idx++ > 1000) break;
+{
+  let seed = 42;
+  const rnd = () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const all: { ci: number; q: any }[] = [];
+  data.forEach((c, ci) => { for (const q of c.qa as any[]) all.push({ ci, q }); });
+  for (let i = all.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [all[i], all[j]] = [all[j], all[i]]; }
+  sampled.push(...all.slice(0, Math.min(SAMPLE_N, all.length)));
 }
 
 const embedder = new Embedder(EMB_MODEL); await embedder.init();
@@ -92,7 +95,10 @@ console.log(`[reader] embedder: ${embedder.model} (ready=${embedder.ready})`);
 const up = await endpointUp(ENDPOINT);
 const model = up ? await modelName(ENDPOINT) : "";
 console.log(`[reader] endpoint ${ENDPOINT} ${up ? `UP (model: ${model})` : "DOWN — running retrieval-only fallback"}`);
-console.log(`[reader] ${sampled.length} QA sampled (round-robin), topK=${TOPK}\n`);
+console.log(`[reader] ${sampled.length} QA sampled (seeded random, seed=42), topK=${TOPK}\n` +
+  `[reader] NOTE: F1/EM/BLEU below are on a 0–1 scale. The LoCoMo/Zero-Mem papers report ×100 —\n` +
+  `[reader] multiply by 100 before comparing (and note: local reader ≠ GPT-4o-mini, strict RAG prompt,\n` +
+  `[reader] sampled subset — this is a lower bound, not a comparable number).`);
 
 // build + embed stores only for touched conversations
 const storeCache = new Map<number, { store: MemoryStore; dia: Map<string, string>; dateOf: Map<string, string> }>();
@@ -130,6 +136,7 @@ console.log(up ? ` END-TO-END on LoCoMo10 (LLM reader @ ${ENDPOINT}, temp=0) ` :
 console.log("========================================================================");
 const n = acc.n || 1;
 if (up) console.log(`  answer F1 ${p(acc.f1 / n)} · EM ${p(acc.em / n)} · BLEU-1 ${p(acc.bleu / n)} · (retrieval hit@${TOPK} ${p(acc.hit / n)})`);
+if (up) console.log(`  ×100 for paper-scale comparison: F1 ${(100 * acc.f1 / n).toFixed(1)} · EM ${(100 * acc.em / n).toFixed(1)} · BLEU-1 ${(100 * acc.bleu / n).toFixed(1)}  (Zero-Mem paper, GPT-4o-mini reader: F1 59.15 / BLEU-1 52.96)`);
 else console.log(`  retrieval hit@${TOPK} ${p(acc.hit / n)} (no LLM → no answer scoring)`);
 console.log("  --- by category ---");
 const CN = { 1: "single-session", 2: "multi-session", 3: "temporal", 4: "open-domain", 5: "adversarial" };

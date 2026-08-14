@@ -2,10 +2,10 @@
  * One-shot: migrate a legacy inline-embedding store.json to the v0.5
  * int8 sidecar format. Backs up the original first. Safe to re-run.
  */
-import { MemoryStore, makeExtractor } from "./core.ts";
+import { MemoryStore, makeExtractor, Embedder } from "./core.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { copyFileSync, existsSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 
 const p = join(homedir(), ".pi", "agent", "zero-mem", "store.json");
 const bak = p.replace(/\.json$/i, ".json.bak");
@@ -21,6 +21,14 @@ if (existsSync(p) && !existsSync(bak)) {
 }
 
 const store = new MemoryStore(p, makeExtractor(null));
+// v0.13: preserve the store's embedder stamp. Without this, persist() wrote
+// `embedder: undefined`, and the next agent start saw a model mismatch and
+// nulled every embedding — forcing a full re-embed of what we just packed.
+// (No stamp = genuinely legacy vectors from an unknown model; re-embed is then
+// correct, so we leave it unset in that case.)
+let stamp: string | undefined;
+try { stamp = JSON.parse(readFileSync(p, "utf8"))?.embedder; } catch { /* absent */ }
+if (stamp) store.embedder = new Embedder(stamp);
 store.load();
 const inline = store.units.filter((u) => Array.isArray(u.embedding) && u.embedding!.length).length;
 const inBin = existsSync(emb);
@@ -33,4 +41,4 @@ const afterBin = existsSync(emb) ? statSync(emb).size : 0;
 console.log("store.json after :", (afterJson / 1024).toFixed(1), "KB");
 console.log("store.emb.bin    :", (afterBin / 1024).toFixed(1), "KB");
 console.log("total after      :", ((afterJson + afterBin) / 1024).toFixed(1), "KB");
-console.log("reduction        :", ((1 - (afterJson + afterBin) / before) * 100).toFixed(1), "%");
+console.log("reduction        :", before > 0 ? ((1 - (afterJson + afterBin) / before) * 100).toFixed(1) + "%" : "n/a (no prior store)");

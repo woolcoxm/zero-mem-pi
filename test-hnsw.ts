@@ -33,12 +33,12 @@ const N = 3000, K = 10;
 const vecs: number[][] = [];
 for (let i = 0; i < N; i++) vecs.push(randUnit());
 const idx = new HNSWIndex({ M: 16, efConstruction: 100 });
-const tb = performance.now(); idx.build(vecs); idx.unitIndex = vecs.map((_, i) => i);
+const tb = performance.now(); idx.build(vecs); idx.unitIds = vecs.map((_, i) => String(i));
 console.log(`built HNSW over ${N} dim-${DIM} vectors in ${(performance.now() - tb).toFixed(0)} ms`);
 let hits = 0, tot = 0;
 for (let t = 0; t < 60; t++) {
   const q = randUnit(); const bf = new Set(bruteTopK(q, vecs, K));
-  const ap = idx.searchUnitIndices(q, K, 200);
+  const ap = idx.searchUnitIds(q, K, 200).map(Number);
   for (const id of ap) { tot++; if (bf.has(id)) hits++; }
 }
 const recall = hits / tot;

@@ -28,15 +28,15 @@ console.log("--- Part 1: HNSWIndex.add() makes a new vector searchable ---");
 const base = Array.from({ length: 300 }, (_, i) => vec(i));
 const h = new HNSWIndex({ M: 16, efConstruction: 200 });
 h.build(base);
-h.unitIndex = base.map((_, i) => i);
-check("built index size == base", h.size === base.length && h.unitIndex.length === base.length, `(size ${h.size})`);
+h.unitIds = base.map((_, i) => String(i));
+check("built index size == base", h.size === base.length && h.unitIds.length === base.length, `(size ${h.size})`);
 
-const newIdx = 9999;
-const newVec = vec(newIdx);
-check("before add: new vector's unitIdx is NOT yet returned", !h.searchUnitIndices(newVec, 50, 300).includes(newIdx));
+const newIdx = "u9999";
+const newVec = vec(newIdx.length);
+check("before add: new vector's unit id is NOT yet returned", !h.searchUnitIds(newVec, 50, 300).includes(newIdx));
 h.add(newVec, newIdx);
-check("after add: new vector is searchable (its unitIdx returned)", h.searchUnitIndices(newVec, 50, 300).includes(newIdx));
-check("after add: index grew by exactly one", h.size === base.length + 1 && h.unitIndex.length === base.length + 1, `(size ${h.size})`);
+check("after add: new vector is searchable (its unit id returned)", h.searchUnitIds(newVec, 50, 300).includes(newIdx));
+check("after add: index grew by exactly one", h.size === base.length + 1 && h.unitIds.length === base.length + 1, `(size ${h.size})`);
 
 console.log("\n--- Part 2: MemoryStore folds newly-embedded units into the live index ---");
 const path = "C:/Users/Robot/projects/zero-mem-pi/.zm-incr-test.json";
@@ -61,7 +61,7 @@ let reachable = 0;
 for (let i = 0; i < store.units.length; i++) {
   const u = store.units[i];
   if (!newTexts.includes(u.text) || !u.embedding) continue;
-  if (store.hnsw!.searchUnitIndices(u.embedding, 20, 300).includes(i)) reachable++;
+  if (store.hnsw!.searchUnitIds(u.embedding, 20, 300).includes(u.id)) reachable++;
 }
 check("newly-embedded units are searchable via the live HNSW", reachable === newTexts.length, `(${reachable}/${newTexts.length} reachable)`);
 check("incremental adds did NOT trigger a spurious rebuild", store.hnswBuiltFor === builtFor0, `(hnswBuiltFor ${store.hnswBuiltFor})`);

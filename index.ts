@@ -4,10 +4,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { MemoryStore, Embedder, retrieve, formatEvidence, makeExtractor, flattenContent, fingerprint, calibrate, type Hit } from "./core.ts";
+import { MemoryStore, Embedder, retrieve, formatEvidence, makeExtractor, flattenContent, fingerprint, calibrate, parseEnvNum, parseEnvNumOpt, type Hit } from "./core.ts";
 
 type Role = "user" | "assistant" | "tool";
 
@@ -20,12 +19,14 @@ export default async function (pi: ExtensionAPI) {
   const storePath = process.env.ZERO_MEM_STORE ??
     join(homedir(), ".pi", "agent", "zero-mem", "store.json");
   const store = new MemoryStore(storePath, extract);
-  if (process.env.ZERO_MEM_MAX_UNITS) store.maxUnits = Number(process.env.ZERO_MEM_MAX_UNITS) || store.maxUnits; // v0.5 retention
-  if (process.env.ZERO_MEM_MAX_AGE_DAYS) store.maxAgeMs = (Number(process.env.ZERO_MEM_MAX_AGE_DAYS) || 0) * 24 * 3600 * 1000; // v0.5
+  // v0.13: strict env parsing — `Number(x) || def` made `0` become the default
+  // and `abc`/`""` become NaN (NaN λ silently disabled MMR diversity).
+  if (process.env.ZERO_MEM_MAX_UNITS !== undefined) store.maxUnits = parseEnvNum(process.env.ZERO_MEM_MAX_UNITS, store.maxUnits); // v0.5 retention
+  if (process.env.ZERO_MEM_MAX_AGE_DAYS !== undefined) store.maxAgeMs = parseEnvNum(process.env.ZERO_MEM_MAX_AGE_DAYS, 90) * 24 * 3600 * 1000; // v0.5
   // v0.6: slimmer per-request injection (the latency lever on slow local models).
-  const injectTopK = Math.max(1, Number(process.env.ZERO_MEM_INJECT_TOPK ?? 3));
-  const injectSnippet = Math.max(40, Number(process.env.ZERO_MEM_INJECT_SNIPPET ?? 120));
-  const mmrLambda = process.env.ZERO_MEM_MMR_LAMBDA ? Math.min(1, Math.max(0, Number(process.env.ZERO_MEM_MMR_LAMBDA))) : undefined; // v0.9: unset → adaptive (see core.adaptiveMmrLambda); set → fixed override
+  const injectTopK = parseEnvNum(process.env.ZERO_MEM_INJECT_TOPK, 3, [1, 40]);
+  const injectSnippet = parseEnvNum(process.env.ZERO_MEM_INJECT_SNIPPET, 120, [40, 4000]);
+  const mmrLambda = parseEnvNumOpt(process.env.ZERO_MEM_MMR_LAMBDA, [0, 1]); // v0.9: unset/invalid → adaptive (see core.adaptiveMmrLambda); set → fixed override
   const federateEnabled = process.env.ZERO_MEM_FEDERATE !== "0"; // v0.9: cross-project fallback when a project has nothing relevant
   const hybridEnabled = process.env.ZERO_MEM_HYBRID !== "0"; // v0.9: lexical+dense fusion (default on)
   const fusionMode = (process.env.ZERO_MEM_FUSION ?? "coverage") as "coverage" | "max" | "weighted"; // v0.9: coverage router (default) — BM25 for factual lookups, dense for paraphrase
@@ -59,17 +60,20 @@ export default async function (pi: ExtensionAPI) {
           else if (ctx.hasUI) ctx.ui.setStatus?.("zero-mem-calibrate", "calibrate: ok");
         } catch { /* best-effort */ }
       }
+      // v0.13: keep the 500-char storage cap, but pass the FULL text for
+      // fingerprinting so activeContext exclusion matches the whole message.
+      const fpText = text;
       if (role === "toolResult") text = text.slice(0, 500);
       if (!text || text.trim().length < 3) return;
       if (/^[\s.!?,;:]+$/.test(text)) return;
       store.add({
-        sessionId: ctx.sessionManager?.getSessionId?.() ?? "unknown",
+        sessionId: sessionIdOf(ctx),
         sessionName: ctx.sessionManager?.getSessionName?.(),
         cwd: ctx.cwd,
         role: (role === "toolResult" ? "tool" : role) as Role,
         text,
         timestamp: Date.now(),
-      });
+      }, fpText);
       store.persistDebounced();
       warmEmbeddings();
       if (ctx.hasUI) ctx.ui.setStatus?.("zero-mem", `memory: ${store.size()} units`);
@@ -81,7 +85,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
-      const hits = await retrieve(query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(query, store, { cwd: ctx.cwd, sessionId: sessionIdOf(ctx), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
       lastInjection = { query, hits };
       if (!hits.length) return;
       return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
@@ -101,7 +105,7 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const q = (args || "").trim();
       if (!q) { ctx.ui.notify?.(storeStats(store, ctx.cwd), "info"); return; }
-      const hits = await retrieve(q, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, topK: 8, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(q, store, { cwd: ctx.cwd, sessionId: sessionIdOf(ctx), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, topK: 8, activeContext: activeContextFingerprints(ctx) });
       if (!hits.length) { ctx.ui.notify?.("No matching memory.", "info"); return; }
       ctx.ui.setWidget?.("zero-mem", [formatEvidence(hits), `query: ${q}`]);
     },
@@ -129,12 +133,20 @@ export default async function (pi: ExtensionAPI) {
     description:
       "Search prior session memory for the current project (deterministic, zero extra model calls). " +
       "Returns up to 8 relevant snippets with timestamps. Use when you need context from earlier work.",
-    parameters: Type.Object({
-      query: Type.String({ description: "What to recall (entities, file names, decisions, etc.)" }),
-    }),
+    // v0.13: plain JSON schema (Type.Object from "typebox" was a runtime import
+    // not declared in package.json — it only worked when the pi host happened
+    // to resolve it; the literal schema is identical and dependency-free).
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to recall (entities, file names, decisions, etc.)" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    } as any,
     async execute(_id: string, params: { query: string }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
       await ensureLoaded();
-      const hits = await retrieve(params.query, store, { cwd: ctx.cwd, sessionId: ctx.sessionManager?.getSessionId?.(), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, topK: 8, activeContext: activeContextFingerprints(ctx) });
+      const hits = await retrieve(params.query, store, { cwd: ctx.cwd, sessionId: sessionIdOf(ctx), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, topK: 8, activeContext: activeContextFingerprints(ctx) });
       return {
         content: [{ type: "text" as const, text: hits.length ? formatEvidence(hits) : "No matching memory." }],
         details: { hits: hits.length },
@@ -143,16 +155,46 @@ export default async function (pi: ExtensionAPI) {
   });
 }
 
+/** v0.14b: session id across the pi API shapes we've seen. If every accessor
+ *  misses, recent-exclusion's session scoping is silently disabled (units from
+ *  the current conversation get injected seconds after being said — the exact
+ *  "what is your name?" confusion). The fallback "unknown" at least groups
+ *  captures consistently; retrieve() then still excludes them by time within
+ *  the same "unknown" session. */
+function sessionIdOf(ctx: any): string {
+  const sm = ctx?.sessionManager;
+  return (
+    sm?.getSessionId?.() ??
+    sm?.session?.id ??
+    sm?.currentSession?.id ??
+    ctx?.session?.id ??
+    ctx?.sessionId ??
+    "unknown"
+  );
+}
+
 function activeContextFingerprints(ctx: any): Set<string> {
   // v0.3: fingerprints of everything currently in the model's context window,
   // so retrieval skips memories the model can already see (no redundant injection).
+  // v0.14b: try every accessor shape — a single missed shape silently disabled
+  // the whole exclusion.
   const fps = new Set<string>();
   try {
     const sm = ctx?.sessionManager;
-    const entries = sm?.buildContextEntries?.() ?? sm?.getBranch?.() ?? sm?.getEntries?.() ?? [];
+    const entries: any[] =
+      sm?.buildContextEntries?.() ??
+      sm?.getBranch?.() ??
+      sm?.getEntries?.() ??
+      sm?.session?.entries ??
+      ctx?.session?.entries ??
+      [];
     for (const e of entries) {
-      const txt = flattenContent(e?.message?.content ?? e?.content);
-      if (txt && txt.trim().length > 3) fps.add(fingerprint(txt));
+      // message content shows up under different keys depending on entry shape
+      const cands = [e?.message?.content, e?.content, e?.text, e?.message?.text];
+      for (const c of cands) {
+        const txt = flattenContent(c);
+        if (txt && txt.trim().length > 3) fps.add(fingerprint(txt));
+      }
     }
   } catch { /* best-effort: on failure, exclude nothing */ }
   return fps;

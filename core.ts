@@ -7,7 +7,7 @@
  */
 
 import { join } from "node:path";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync } from "node:fs";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 export type Role = "user" | "assistant" | "tool";
@@ -37,6 +37,7 @@ export interface RetrieveOpts {
   minScore?: number;           // v0.3: relevance floor (default 0.15) — drop weak/tangential hits
   calibrateEvidence?: boolean; // v0.11: evidence calibration (paper Eq 15) — re-rank admissible evidence by answer-type compatibility (temporal→dates, quantity→numbers). Default ON (helps top-1/MRR, neutral elsewhere).
   useBridges?: boolean;        // v0.4: enable co-occurrence relational bridges (default true)
+  useClosure?: boolean;        // v0.13: enable evidence closure (default true); evals disable it to measure the retriever alone
   useHnsw?: boolean;           // v0.6: HNSW ANN for semantic search at scale (default true; auto-gated by store.hnswThreshold)
   hnswEf?: number;             // v0.6: HNSW search ef (default 200 ~ recall 0.90 at dim 384; raise for more recall)
   mmr?: boolean;               // v0.7: maximal-marginal-relevance diversity selection (default true)
@@ -89,7 +90,10 @@ export function makeExtractor(nlp: any) {
       found.add(t);
     };
     let m: RegExpExecArray | null;
-    const pathRe = /([\w./-]+\/[\w./-]+)|([\w-]+\.(ts|js|tsx|jsx|py|rs|go|java|c|cpp|cc|h|hpp|md|json|yaml|yml|toml|sh|css|html|sql))/gi;
+    // v0.13: (a) the slash branch now requires a dot somewhere (src/lib.ts,
+    // a/b/c dirs) so prose like "and/or", "1/2", "he/she" stops polluting the
+    // entity graph; (b) added a backslash branch so Windows paths match too.
+    const pathRe = /([\w.\\\/-]*[.\\\/][\w.\\\/-]*[.\\\/][\w.\\\/-]*)|([\w-]+\.(ts|js|tsx|jsx|py|rs|go|java|c|cpp|cc|h|hpp|md|json|yaml|yml|toml|sh|css|html|sql))|((?:[\w.-]+\\){1,}[\w.-]+)/gi;
     while ((m = pathRe.exec(text)) !== null) add(m[0]);
     const tickRe = /`([^`\n]{2,40})`/g;
     while ((m = tickRe.exec(text)) !== null) add(m[1]);
@@ -163,11 +167,18 @@ export class EntityGraph {
   entityUnits = new Map<string, Set<string>>();
   unitEntities = new Map<string, string[]>();
   cooc = new Map<string, number>(); // v0.4: entity-pair co-occurrence weights (relational bridges)
+  // v0.14 (paper Eq 8–10): unit-level adjacency for Personalized PageRank.
+  // Edge weight between two units = Σ idf(e) over their SHARED entities, where
+  // idf(e) = log(N/df(e)) — the paper's per-context-unit normalized entity
+  // occurrence frequency (Eq 4). Entities appearing in a large fraction of all
+  // units are skipped (they form dense cliques that wash out propagation).
+  unitAdj = new Map<string, Map<string, number>>();
 
   rebuild(units: TraceUnit[]) {
     this.entityUnits.clear();
     this.unitEntities.clear();
     this.cooc.clear();
+    this.unitAdj.clear();
     for (const u of units) {
       this.unitEntities.set(u.id, u.entities);
       for (const e of u.entities) {
@@ -182,6 +193,22 @@ export class EntityGraph {
           this.cooc.set(k, (this.cooc.get(k) ?? 0) + 1);
         }
     }
+    // v0.14: idf-weighted unit adjacency (shared-entity edges).
+    const N = Math.max(1, units.length);
+    const dfCap = Math.max(20, Math.floor(N * 0.1)); // skip clique-forming ubiquitous entities
+    for (const [e, us] of this.entityUnits) {
+      if (us.size > dfCap) continue;
+      const w = Math.log(1 + N / us.size);
+      const ids = [...us];
+      for (const a of ids) {
+        let row = this.unitAdj.get(a);
+        if (!row) { row = new Map(); this.unitAdj.set(a, row); }
+        for (const b of ids) {
+          if (a === b) continue;
+          row.set(b, (row.get(b) ?? 0) + w);
+        }
+      }
+    }
   }
   queryEntities(qEntities: string[]): Map<string, number> {
     const scores = new Map<string, number>();
@@ -191,6 +218,38 @@ export class EntityGraph {
       for (const uid of s) scores.set(uid, (scores.get(uid) ?? 0) + 1);
     }
     return scores;
+  }
+  /** v0.14 (paper Eq 9–10): Personalized PageRank over the unit graph.
+   *  π ← (1−γ)·r + γ·Pᵀπ, with r the query reset vector (seed masses on units
+   *  mentioning query-matched entities) and P the row-normalized transition
+   *  matrix over idf-weighted shared-entity edges. Power iteration to
+   *  convergence (L1 < 1e-6, capped at 24 passes). Returns the stationary
+   *  distribution restricted to non-zero mass. */
+  ppr(seeds: Map<string, number>, gamma = 0.6, iters = 24): Map<string, number> {
+    let mass = 0;
+    for (const v of seeds.values()) mass += v;
+    if (!mass || !this.unitAdj.size) return new Map(seeds);
+    const r = new Map<string, number>();
+    for (const [k, v] of seeds) r.set(k, v / mass);
+    let pi = new Map(r);
+    for (let it = 0; it < iters; it++) {
+      const next = new Map<string, number>();
+      for (const [k, v] of r) next.set(k, (1 - gamma) * v);
+      // Pᵀπ: each unit distributes its mass along row-normalized edges
+      for (const [u, m] of pi) {
+        if (m <= 0) continue;
+        const row = this.unitAdj.get(u);
+        if (!row || !row.size) { next.set(u, (next.get(u) ?? 0) + gamma * m); continue; } // dangling: keep mass
+        let rowSum = 0;
+        for (const w of row.values()) rowSum += w;
+        for (const [v, w] of row) next.set(v, (next.get(v) ?? 0) + gamma * m * (w / rowSum));
+      }
+      let diff = 0;
+      for (const k of next.keys()) diff += Math.abs((next.get(k) ?? 0) - (pi.get(k) ?? 0));
+      pi = next;
+      if (diff < 1e-6) break;
+    }
+    return pi;
   }
   neighbors(unitId: string): Set<string> {
     const out = new Set<string>();
@@ -252,11 +311,16 @@ export class Embedder {
   ready = false;
   dim = 384;
   private loading: Promise<void> | null = null;
+  // v0.14: cache for short strings (entity names) — the paper matches query
+  // entities to graph entities by embedding cosine (Eq 8); caching keeps the
+  // per-query cost to the unseen entities only. Cleared on init().
+  entityCache = new Map<string, number[] | null>();
   model: string = "Xenova/bge-small-en-v1.5"; // v0.10 default (proven). v0.11 note: the paper uses BGE-M3, but it underperformed bge-small with mean pooling on LoCoMo (r@5 0.20 vs 0.42) and is too slow for full eval on CPU (paper used a GPU). Configurable below for opt-in.
   pooling: "mean" | "cls" = "mean"; // BGE-M3 prefers "cls" (mean crams near-matches); bge-small uses "mean"
   constructor(model?: string, pooling?: "mean" | "cls") { if (model !== undefined) this.model = model; if (pooling) this.pooling = pooling; }
 
   async init(): Promise<void> {
+    if (this.ready) return;
     if (this.loading) return this.loading;
     this.loading = (async () => {
       try {
@@ -266,19 +330,32 @@ export class Embedder {
         env.backends?.onnx?.wasm?.setThreads?.(1);
         this.pipe = await mod.pipeline("feature-extraction", this.model, { quantized: true });
         this.ready = true;
+        this.entityCache.clear();
         console.log(`[zero-mem] embeddings ready (${this.model})`);
       } catch (e: any) {
         console.warn("[zero-mem] embeddings unavailable — using BM25 fallback:", e?.message ?? e);
         this.ready = false;
+        // v0.13: a transient fetch failure used to be memoized for the whole
+        // process lifetime (loading stayed set even though init failed), so
+        // embeddings never came back without a restart. Clear it so the next
+        // init() retries.
+        this.loading = null;
       }
     })();
-    return this.loading;
+    return this.loading!;
   }
 
   async embed(text: string): Promise<number[] | null> {
     if (!this.ready || !this.pipe) return null;
     const out = await this.pipe(text, { pooling: this.pooling, normalize: true });
     return Array.from(out.data as Float32Array);
+  }
+  /** v0.14: embed a short string (entity) with caching. */
+  async embedCached(text: string): Promise<number[] | null> {
+    if (this.entityCache.has(text)) return this.entityCache.get(text)!;
+    const v = await this.embed(text);
+    this.entityCache.set(text, v);
+    return v;
   }
 }
 
@@ -305,7 +382,13 @@ export function quantize(vec: number[]): { scale: number; bytes: Int8Array } {
 }
 export function dequantize(scale: number, bytes: Int8Array | number[]): number[] {
   const out = new Array<number>(bytes.length);
-  for (let i = 0; i < bytes.length; i++) out[i] = (bytes[i] / 127) * scale;
+  let nrm = 0;
+  for (let i = 0; i < bytes.length; i++) { out[i] = (bytes[i] / 127) * scale; nrm += out[i] * out[i]; }
+  // v0.13: re-L2-normalize after quantization round-trip. HNSW's distance is a
+  // raw dot product (valid only for unit vectors), while brute force uses true
+  // cosine; quantization drifts norms off 1, so the two paths could disagree on
+  // near-ties. Renormalizing makes dot == cosine again for dequantized vectors.
+  if (nrm > 0) { const inv = 1 / Math.sqrt(nrm); for (let i = 0; i < out.length; i++) out[i] *= inv; }
   return out;
 }
 
@@ -334,7 +417,10 @@ class Heap<T> {
 // (embeddings are L2-normalized, so cosine = dot product).
 export class HNSWIndex {
   M: number; Mmax: number; Mmax0: number; efConstruction: number; mL: number;
-  unitIndex: number[] = [];            // hnsw node id -> unit array index
+  // hnsw node id -> unit ID (stable across retention trims; storing array
+  // indices went stale whenever enforceRetention filtered this.units, making
+  // the index silently return the WRONG units — v0.13 fix)
+  unitIds: string[] = [];
   private data: number[][] = [];
   private levelOf: number[] = [];
   private layers: Array<Map<number, number[]>> = [];
@@ -364,13 +450,13 @@ export class HNSWIndex {
     }
   }
   // v0.9: insert a SINGLE new vector into the live index and map its node to
-  // `unitIdx` (the store's unit-array index). Keeps freshly-added units
-  // searchable at scale instead of waiting for the next growth-gated rebuild
-  // (which would otherwise leave them score-0 / invisible to semantic search
-  // until embedded-count grows +50%). Incremental inserts gradually dilute graph
-  // quality, but MemoryStore.ensureHnsw still triggers a periodic full rebuild
-  // (which subsumes these nodes and resets quality), so this is purely additive.
-  add(q: number[], unitIdx: number) { this.insert(q); this.unitIndex.push(unitIdx); }
+  // the unit's stable ID. Keeps freshly-added units searchable at scale instead
+  // of waiting for the next growth-gated rebuild (which would otherwise leave
+  // them score-0 / invisible to semantic search until embedded-count grows
+  // +50%). Incremental inserts gradually dilute graph quality, but
+  // MemoryStore.ensureHnsw still triggers a periodic full rebuild (which
+  // subsumes these nodes and resets quality), so this is purely additive.
+  add(q: number[], unitId: string) { this.insert(q); this.unitIds.push(unitId); }
   private neighbors(lc: number, node: number): number[] { return this.layers[lc].get(node) ?? []; }
   private insert(q: number[]) {
     const id = this.data.length; this.data.push(q);
@@ -433,12 +519,17 @@ export class HNSWIndex {
     for (const e of C) { if (R.length >= M) break; if (!R.includes(e)) R.push(e); }
     return R;
   }
-  searchUnitIndices(q: number[], k: number, ef?: number): number[] {
+  searchUnitIds(q: number[], k: number, ef?: number): string[] {
     if (this.entry === -1) return [];
     let ep = [this.entry];
     for (let lc = this.entryLevel; lc > 0; lc--) ep = this.searchLayer(q, ep, 1, lc).map((x) => x.id);
     const W = this.searchLayer(q, ep, Math.max(ef ?? 200, k), 0);
-    return W.slice(0, k).map((w) => this.unitIndex[w.id] ?? -1).filter((i) => i >= 0);
+    const out: string[] = [];
+    for (const w of W.slice(0, k)) {
+      const id = this.unitIds[w.id];
+      if (id !== undefined) out.push(id);
+    }
+    return out;
   }
 }
 
@@ -462,6 +553,8 @@ export class MemoryStore {
   private hnswBuiltFor = -1;        // v0.6: embedded-count the index was built for (growth-gated rebuild)
   private hnswBuilding = false;     // v0.7: background build in progress
   private hnswPromise: Promise<void> | null = null; // v0.7: awaited by tests
+  private loadError = false;        // v0.13: load() failed (corrupt store) — persist() must NOT overwrite with empty
+  private loadedMtimeMs = 0;        // v0.13: store.json mtime at load — detect another process's writes before persisting
   extract: (text: string) => string[];
 
   constructor(path: string, extract: (t: string) => string[]) {
@@ -473,6 +566,7 @@ export class MemoryStore {
     let raw: any = null;
     try {
       if (existsSync(this.path)) {
+        try { this.loadedMtimeMs = statSync(this.path).mtimeMs; } catch { this.loadedMtimeMs = 0; }
         raw = JSON.parse(readFileSync(this.path, "utf8"));
         this.units = Array.isArray(raw?.units) ? raw.units : [];
         for (const u of this.units) if (!u.tokens || !u.tokens.length) u.tokens = tokenize(u.text); // v0.7: tokens not persisted; recompute from text
@@ -492,8 +586,41 @@ export class MemoryStore {
         for (const u of this.units) u.embedding = undefined;
       }
       this.enforceRetention();
-    } catch (e) { console.error("[zero-mem] failed to load store:", e); }
+    } catch (e) {
+      // v0.13: a failed load (e.g. corrupt JSON from a crash mid-write) must
+      // leave the store marked errored so persist() refuses to write — the old
+      // behavior silently overwrote the entire memory with an empty store.
+      this.loadError = true;
+      console.error("[zero-mem] failed to load store (persist disabled until cleared; investigate/recover", this.path, "):", e);
+    }
     this.dirty = true;
+  }
+  /** v0.13: another pi process may have written store.json since our load()
+   *  (all sessions share the file; the old last-writer-wins persist silently
+   *  erased the other session's captures). Merge their units into ours by id
+   *  before writing. Best-effort — if the merge read fails we still write. */
+  private mergeForeignWrites() {
+    try {
+      if (!existsSync(this.path)) return;
+      const mtime = statSync(this.path).mtimeMs;
+      if (!(mtime > this.loadedMtimeMs)) return; // unchanged since our load/write
+      const raw = JSON.parse(readFileSync(this.path, "utf8"));
+      const foreign: TraceUnit[] = Array.isArray(raw?.units) ? raw.units : [];
+      const mine = new Set(this.units.map((u) => u.id));
+      let added = 0;
+      for (const u of foreign) {
+        if (!u?.id || mine.has(u.id)) continue;
+        if (!u.tokens || !u.tokens.length) u.tokens = tokenize(u.text ?? "");
+        this.units.push(u); added++;
+      }
+      if (typeof raw?.counter === "number" && raw.counter > this.counter) this.counter = raw.counter;
+      if (added) {
+        console.log(`[zero-mem] merged ${added} unit(s) written by another session`);
+        this.enforceRetention();
+        this.dirty = true;
+      }
+      this.loadedMtimeMs = mtime;
+    } catch { /* merge is best-effort */ }
   }
   /** Read the int8 sidecar and dequantize into unit.embedding. */
   private loadEmbeddings() {
@@ -543,8 +670,10 @@ export class MemoryStore {
       buf.writeFloatLE(scale, off); off += 4;
       buf.set(bytes, off); off += dim; // Int8 bit pattern → Uint8 (Buffer)
     }
-    writeFileSync(this.embPath, buf);
-  }
+      const tmpBin = this.embPath + ".tmp";
+      writeFileSync(tmpBin, buf);
+      renameSync(tmpBin, this.embPath); // v0.13: atomic — no torn sidecar on crash
+    }
   /** v0.6/v0.7: build the HNSW index over embedded units when the store crosses
    *  hnswThreshold; below it, leave null so retrieve() uses exact brute force
    *  (which is faster AND exact below ~10k units). Rebuild is growth-gated so a
@@ -556,22 +685,21 @@ export class MemoryStore {
   ensureHnsw(): Promise<void> | null {
     if (!this.hnswEnabled) { this.hnsw = null; return null; }
     if (this.hnswBuilding) return this.hnswPromise;
-    const idx: number[] = [];
-    for (let i = 0; i < this.units.length; i++) if (this.units[i].embedding && this.units[i].embedding!.length) idx.push(i);
-    if (idx.length < this.hnswThreshold) { this.hnsw = null; return null; }
-    if (this.hnsw && this.hnswBuiltFor > 0 && idx.length < this.hnswBuiltFor * 1.5) return null; // growth-gated: skip until +50%
-    const vectors = idx.map((i) => this.units[i].embedding!);
+    const embedded: TraceUnit[] = [];
+    for (const u of this.units) if (u.embedding && u.embedding.length) embedded.push(u);
+    if (embedded.length < this.hnswThreshold) { this.hnsw = null; return null; }
+    if (this.hnsw && this.hnswBuiltFor > 0 && embedded.length < this.hnswBuiltFor * 1.5) return null; // growth-gated: skip until +50%
     this.hnswBuilding = true;
-    this.hnswPromise = this.buildHnswInBackground(idx, vectors);
+    this.hnswPromise = this.buildHnswInBackground(embedded);
     return this.hnswPromise;
   }
-  private async buildHnswInBackground(idx: number[], vectors: number[][]) {
+  private async buildHnswInBackground(embedded: TraceUnit[]) {
     try {
       const h = new HNSWIndex({ M: 16, efConstruction: 200 });
-      await h.buildAsync(vectors); // chunked + yields; does not block the turn
-      h.unitIndex = idx;
+      await h.buildAsync(embedded.map((u) => u.embedding!)); // chunked + yields; does not block the turn
+      h.unitIds = embedded.map((u) => u.id); // stable IDs — survive retention trims (v0.13)
       this.hnsw = h;
-      this.hnswBuiltFor = idx.length;
+      this.hnswBuiltFor = embedded.length;
     } catch (e) { console.error("[zero-mem] HNSW build failed:", e); }
     finally { this.hnswBuilding = false; this.hnswPromise = null; }
   }
@@ -601,24 +729,36 @@ export class MemoryStore {
    *  v0.9: if the HNSW index is already live, fold each newly-embedded unit in
    *  incrementally so it's searchable at scale right away (no waiting for the
    *  next +50% rebuild). Skipped while a background build is in progress — that
-   *  build reads all current embeddings fresh and will include the unit anyway. */
-  async embedAll() {
+   *  build reads all current embeddings fresh and will include the unit anyway.
+   *  v0.13: `limit` bounds how many units this call embeds. retrieve() passes a
+   *  small budget so a fresh process over a large unembedded store doesn't pay
+   *  the whole embedding cost inside the first turn; warmEmbeddings keeps
+   *  embedding the rest in the background. */
+  async embedAll(limit = Infinity) {
     if (!this.embedder || !this.embedder.ready) return;
+    let n = 0;
     for (let i = 0; i < this.units.length; i++) {
+      if (n >= limit) break;
       const u = this.units[i];
       if (u.embedding && u.embedding.length) continue;
       u.embedding = await this.embedder.embed(u.text);
+      n++;
       if (this.hnsw && this.hnswEnabled && !this.hnswBuilding) {
-        try { this.hnsw.add(u.embedding, i); } catch { /* best-effort; next rebuild recovers */ }
+        try { if (u.embedding) this.hnsw.add(u.embedding, u.id); } catch { /* best-effort; next rebuild recovers */ }
       }
     }
   }
-  add(partial: Omit<TraceUnit, "id" | "entities" | "tokens" | "fp">): TraceUnit {
+  add(partial: Omit<TraceUnit, "id" | "entities" | "tokens" | "fp">, fpText?: string): TraceUnit {
     const text = partial.text.slice(0, 4000);
     const id = `u${Date.now().toString(36)}_${(this.counter++).toString(36)}`;
     const unit: TraceUnit = {
       ...partial, id, text,
-      fp: fingerprint(text),
+      // v0.13: fingerprint the FULL text (fpText), not the truncated copy.
+      // activeContext fingerprints whole messages from the session; callers
+      // that truncate for storage (index.ts caps tool results at 500 chars)
+      // pass the original here, so long content — exactly what's most worth
+      // suppressing — actually matches and is excluded from injection.
+      fp: fingerprint(fpText ?? partial.text),
       entities: this.extract(text),
       tokens: tokenize(text),
     };
@@ -628,20 +768,29 @@ export class MemoryStore {
     return unit;
   }
   size() { return this.units.length; }
-  clear() { this.units = []; this.dirty = true; }
+  clear() { this.units = []; this.dirty = true; this.loadError = false; } // v0.13: explicit reset also re-enables persist after a failed load
   persistDebounced(delay = 1500) {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => { this.persist(); this.saveTimer = null; }, delay);
   }
   async persist() {
+    if (this.loadError) {
+      console.error("[zero-mem] persist skipped: store failed to load (would overwrite a possibly-recoverable store; run /memory-clear to reset)");
+      return;
+    }
     try {
+      this.mergeForeignWrites(); // v0.13: don't erase another live session's captures
       mkdirSync(join(this.path, ".."), { recursive: true });
       // v0.5: store.json stays text-only (small, human-readable); embeddings are
       // quantized to int8 in the .bin sidecar (~21x smaller than inline JSON).
       // v0.7: tokens are NOT persisted (recomputed from text on load) to shrink the JSON further.
+      // v0.13: write temp + rename so a crash mid-write can never corrupt the store.
       const stubs = this.units.map((u) => { const { tokens, embedding, ...rest } = u; return rest; });
-      writeFileSync(this.path, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter, embedder: this.embedder?.model }));
+      const tmpJson = this.path + ".tmp";
+      writeFileSync(tmpJson, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter, embedder: this.embedder?.model }));
+      renameSync(tmpJson, this.path);
       this.writeEmbeddings(this.units);
+      try { this.loadedMtimeMs = statSync(this.path).mtimeMs; } catch { /* ignore */ }
     } catch (e) { console.error("[zero-mem] failed to persist:", e); }
   }
 }
@@ -705,6 +854,35 @@ export function evidenceCompat(query: string, text: string): number {
   return 0; // no detectable expected type → neutral
 }
 
+/** v0.14b: FIRST-PERSON/SECOND-PERSON perspective compatibility (Eq 15 spirit).
+ *  Motivated by a live failure: "what is your name?" (asking the ASSISTANT) pulled
+ *  in "my name is mark." + "your name is Henry." and the reader hallucinated a
+ *  conflict. "my name" and "your name" queries are indistinguishable to BM25 and
+ *  near-identical to the embedder (cos 0.71 vs 0.74) — the discriminator is WHO
+ *  is speaking about WHOM:
+ *    - "your name" query ⇒ compatible only with a USER-role unit that names the
+ *      assistant ("I'll call you X", "your name is X" said BY the user). An
+ *      assistant saying "your name is Henry." is naming the USER — incompatible.
+ *    - "my name" query ⇒ the user's own first-person statement is the direct
+ *      evidence (+1); an assistant restating "your name is ..." is a weaker,
+ *      possibly conflicting echo (−0.5). */
+export function perspectiveCompat(query: string, unit: { role: Role; text: string }): number {
+  const q = query.toLowerCase(), t = unit.text.toLowerCase();
+  const asksAboutYou = /\byour name\b|\byou (are|'re|re) called\b|\bwhat should i call you\b/.test(q);
+  const asksAboutMe = /\bmy name\b|\bwho am i\b|\bwhat did i say\b|\bi (am|'m|m) called\b/.test(q);
+  if (asksAboutYou && !asksAboutMe) {
+    // "naming" = the user ASSIGNS a name ("your name is X", "I'll call you X") —
+    // merely ASKING ("what's your name?") is not evidence.
+    const userNamesAssistant = unit.role === "user" && /\byour name (is|=)\b|\byou are called\b|\byou'?re called\b|\b(i'?ll| will|can|should) call you\b|\bcall you [a-z]/.test(t);
+    return userNamesAssistant ? 1 : -1;
+  }
+  if (asksAboutMe) {
+    if (unit.role === "user" && /\bmy name\b|\bi (am|'m|m) called\b/.test(t)) return 1;
+    if (/\byour name\b|\byou (are|'re|re) called\b/.test(t)) return -0.5; // assistant's restatement of the user's name — echo, not source
+  }
+  return 0; // no perspective signal → neutral
+}
+
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
   store.ensureIndex();
 
@@ -715,7 +893,10 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   if (store.embedder) {
     await store.embedder.init();
     if (store.embedder.ready) {
-      await store.embedAll();
+      // v0.13: bound inline embedding per turn (e.g. first turn after a model
+      // change over a large store no longer embeds everything before answering);
+      // warmEmbeddings finishes the rest in the background after each capture.
+      await store.embedAll(100);
       qEmb = await store.embedder.embed(query);
       useEmb = !!qEmb;
     }
@@ -757,23 +938,38 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   }
   if (!inIdx.length && !outIdx.length) return [];
 
-  const gRaw = new Map<string, number>();
-  if (qEnts.length) for (const [uid, cnt] of store.graph.queryEntities(qEnts)) gRaw.set(uid, cnt);
-
-  // v0.4: relational bridges — units whose entities CO-OCCUR with query entities
-  // (the paper's co-occurrence-weighted entity–context graph) earn graph score even
-  // without a direct mention, so the thread is followed through strong connections.
-  if (opts.useBridges !== false && qEnts.length) {
-    for (const u of store.units) {
-      if (!u.entities.length) continue;
-      let bridge = 0;
-      for (const eq of qEnts) {
-        for (const eu of u.entities) {
-          if (eq === eu) continue;
-          bridge += store.graph.cooc.get(pairKey(eq, eu)) ?? 0;
+  // v0.14 (paper Eq 8–10): the graph view now scores via Personalized PageRank
+  // over idf-weighted shared-entity edges, replacing the v0.4 count-based direct
+  // matches + raw-summed co-occurrence bridges (which the audit showed could
+  // drown direct hits). Seeds: units directly mentioning a query entity, plus —
+  // per the paper, which matches query entities to graph entities by embedding
+  // cosine — units of corpus entities that are embedding-similar to a query
+  // entity (candidates pre-filtered by shared tokens so we only embed a handful
+  // per query; results cached). useBridges:false restores direct-matches-only.
+  let gRaw = new Map<string, number>();
+  if (qEnts.length) {
+    const direct = store.graph.queryEntities(qEnts);
+    if (opts.useBridges === false) {
+      gRaw = direct;
+    } else {
+      const seeds = new Map(direct);
+      if (useEmb && store.embedder) {
+        for (const qe of qEnts) {
+          const qeToks = new Set(tokenize(qe));
+          if (!qeToks.size) continue;
+          const qeEmb = await store.embedder.embedCached(qe);
+          if (!qeEmb) continue;
+          for (const ce of store.graph.entityUnits.keys()) {
+            if (ce === qe || !tokenize(ce).some((t) => qeToks.has(t))) continue; // cheap candidate filter
+            const ceEmb = await store.embedder.embedCached(ce);
+            if (!ceEmb) continue;
+            const sim = cosine(qeEmb, ceEmb);
+            if (sim < 0.7) continue;
+            for (const uid of store.graph.entityUnits.get(ce)!) seeds.set(uid, (seeds.get(uid) ?? 0) + sim);
+          }
         }
       }
-      if (bridge > 0) gRaw.set(u.id, (gRaw.get(u.id) ?? 0) + bridge);
+      gRaw = store.graph.ppr(seeds, 0.6);
     }
   }
 
@@ -785,14 +981,38 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   let semCand: Set<number> | null = null;
   if (useEmb && (opts.useHnsw ?? true)) {
     store.ensureHnsw(); // non-blocking; starts/continues a background build if needed
-    if (store.hnsw) semCand = new Set(store.hnsw.searchUnitIndices(qEmb!, poolSize, opts.hnswEf ?? 200));
+    if (store.hnsw) {
+      const idToIdx = new Map<string, number>();
+      for (let i = 0; i < store.units.length; i++) idToIdx.set(store.units[i].id, i);
+      semCand = new Set();
+      for (const id of store.hnsw.searchUnitIds(qEmb!, poolSize, opts.hnswEf ?? 200)) {
+        const i = idToIdx.get(id);
+        if (i !== undefined) semCand.add(i);
+      }
+    }
   }
 
   // v0.9: score BOTH signals per pool — lexical (BM25) always, plus dense (cosine)
   // when an embedder is loaded — so retrieve can HYBRID-fuse them. Each signal is
   // normalized by its OWN per-pool max so in-project and cross-project hits are each
   // comparable to 1.0 before the federation penalty, and lexical/dense share a scale.
-  const scorePool = (idx: number[]): { bm: Map<number, number>; bmMax: number; bmMin: number; sem: Map<number, number>; semMax: number; semMin: number } => {
+  // v0.14b: POOL CONFIDENCE. Min-max normalization stretches ANY non-constant pool
+  // to [0,1] — so a pool of weak, tangential hits (e.g. the only matching term is
+  // "name") got its best garbage item normalized to 1.0 and injected with a
+  // confident score, confusing the reader ("what is your name?" surfaced a pile of
+  // 5-word name-related chatter). Each component is now additionally scaled by how
+  // strong the pool's RAW best signal is: BM25 by min(1, bmMax/4) (raw 4+ = solid
+  // multi-term match), dense by (cosMax−0.55)/0.25 clamped (bge cosines: <0.55 =
+  // unrelated, 0.8+ = on-topic). Weak pools stay below minScore and nothing is
+  // injected — "no memory" beats "confusing memory".
+  // v0.14b: pool confidence anchors. BM25 raw scores scale with corpus size
+  // (idf grows with N), so a solid multi-term match in a 7-unit store scores
+  // ~1 while the same match in a 600-unit corpus scores ~4+. The anchor ramps
+  // 1.2 → 4 with pool size so small/fresh stores still retrieve (a fixed
+  // anchor of 4 made a brand-new store look dead) while big-store weak pools
+  // still gate out.
+  const bmAnchor = Math.max(1.2, Math.min(4, 1.2 + store.units.length / 200));
+  const scorePool = (idx: number[]): { bm: Map<number, number>; bmMax: number; bmMin: number; bmConf: number; sem: Map<number, number>; semMax: number; semMin: number; semConf: number } => {
     const bm = new Map<number, number>(), sem = new Map<number, number>();
     let bmMax = 0, bmMin = Infinity, semMax = 0, semMin = Infinity;
     for (const i of idx) {
@@ -804,7 +1024,10 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
       }
       sem.set(i, s); if (s > semMax) semMax = s; if (s < semMin) semMin = s;
     }
-    return { bm, bmMax, bmMin, sem, semMax, semMin };
+    const bmConf = Math.min(1, bmMax / bmAnchor);
+    const cosMax = 2 * semMax - 1; // back to raw cosine
+    const semConf = useEmb ? Math.min(1, Math.max(0, (cosMax - 0.55) / 0.25)) : 0;
+    return { bm, bmMax, bmMin, bmConf, sem, semMax, semMin, semConf };
   };
   // v0.9: hybrid fusion. v0.8 used dense-ALONE when an embedder was loaded (discarding
   // BM25), which LoCoMo10 showed UNDERPERFORMS BM25 on real factual lookups (r@5 0.27
@@ -817,27 +1040,38 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   const fusion: "weighted" | "max" | "coverage" = opts.fusion ?? "coverage";
   const semW = Math.min(1, Math.max(0, opts.semanticWeight ?? 0.5));
   const lexW = 1 - semW;
-  type Pool = { bmMax: number; bmMin: number; bm: Map<number, number>; semMax: number; semMin: number; sem: Map<number, number> };
+  type Pool = { bmMax: number; bmMin: number; bmConf: number; bm: Map<number, number>; semMax: number; semMin: number; semConf: number; sem: Map<number, number> };
   // v0.11: min-max normalization per signal (paper Eq 12), not max-norm. BM25's min is
   // ~0 so it's ~unchanged, but dense cosines cluster in [0.5,1]; min-max stretches that
-  // to [0,1], restoring discrimination that max-norm compressed away.
+  // to [0,1], restoring discrimination that max-norm compressed away. Eq 12's
+  // degenerate rule (max==min ⇒ 1) is preserved — a uniformly-matching pool is fine.
+  // v0.14b: the fused score is then scaled ONCE by pool confidence = max(bmConf,
+  // semConf) — "does this pool contain ANY absolutely-strong signal?" Applying
+  // confidence per-component broke Eq 12's degenerate case (a query matching all
+  // docs equally with a strong dense signal got scaled by the weak BM25 arm).
   const mmN = (v: number, lo: number, hi: number) => hi > lo ? (v - lo) / (hi - lo) : (v > 0 ? 1 : 0);
   const hOf = (pool: Pool, i: number): number => {
     const bN = mmN(pool.bm.get(i) ?? 0, pool.bmMin, pool.bmMax);
-    if (!hybrid) return useEmb ? mmN(pool.sem.get(i) ?? 0, pool.semMin, pool.semMax) : bN; // v0.8
+    if (!hybrid) return useEmb ? mmN(pool.sem.get(i) ?? 0, pool.semMin, pool.semMax) * pool.semConf : bN * pool.bmConf; // v0.8
     const sN = mmN(pool.sem.get(i) ?? 0, pool.semMin, pool.semMax);
-    if (fusion === "max") return Math.max(bN, sN);
-    if (fusion === "coverage") return cov * bN + (1 - cov) * sN; // trust lexical when query terms match the corpus
-    return lexW * bN + semW * sN; // weighted
+    const conf = Math.max(pool.bmConf, pool.semConf);
+    if (fusion === "max") return Math.max(bN, sN) * conf;
+    if (fusion === "coverage") return (cov * bN + (1 - cov) * sN) * conf; // trust lexical when query terms match the corpus
+    return (lexW * bN + semW * sN) * conf; // weighted
   };
   const minScore = opts.minScore ?? 0.15; // (hoisted from below; v0.9 federation needs it before the cross-project decision)
   const inPool = scorePool(inIdx);
 
-  const entityDriven = qEnts.length > 0;
+  // v0.14 (paper Eq 6–7 + 13): routing selects the PRIMARY view and gives it ρ;
+  // the secondary gets 1−ρ. Relational queries (a subject anchor — query
+  // entities — is available, no temporal aggregation need) run graph-primary;
+  // local/temporal queries (temporal cues, "yesterday", conversation locality)
+  // run hierarchy-primary. Both views always run; only the fusion weights move
+  // (replaces v0.9's ±0.15 nudges around a fixed base, which never actually
+  // implemented the paper's asymmetric primary/secondary split).
   const temporal = /\b(earlier|before|last|previous|yesterday|ago|used to|recently|back when)\b/i.test(query);
-  let wGraph = rho;
-  if (entityDriven) wGraph = Math.min(0.9, rho + 0.15);
-  else if (temporal) wGraph = Math.max(0.3, rho - 0.2);
+  const relational = qEnts.length > 0 && !temporal;
+  const wGraph = relational ? rho : 1 - rho;
   const wHier = 1 - wGraph;
 
   let gMax = 0, gMin = Infinity;
@@ -850,11 +1084,21 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     return cross ? `${base}+cross-project` : base;
   };
   const cands: Cand[] = [];
+  // v0.14b: graph score is corroborated by the same pool confidence as h — the
+  // paper refines graph ranking with lexical/phrase matches, so PPR mass that
+  // nothing lexical or semantic supports doesn't inject on its own.
+  const gConf = Math.max(inPool.bmConf, inPool.semConf);
   for (const i of inIdx) {
     const u = store.units[i];
     const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
     const h = hOf(inPool, i);
-    const score = wGraph * g + wHier * h;
+    // v0.14b: perspective compatibility (see perspectiveCompat) — "my name" vs
+    // "your name" queries are lexically/embedding-indistinguishable; who is
+    // speaking about whom is the discriminator. Incompatible evidence is pushed
+    // below the injection floor instead of being injected confusingly.
+    const pc = perspectiveCompat(query, u);
+    let score = wGraph * g * gConf + wHier * h + 0.3 * pc;
+    if (pc < 0) score = Math.min(score, minScore * 0.9); // incompatible: cap under the floor
     if (score <= 0) continue;
     cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h) });
   }
@@ -867,11 +1111,12 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
       !cands.some((c) => c.score > minScore)) {
     const outPool = scorePool(outIdx);
     const federatePenalty = opts.federatePenalty ?? 0.7;
+    const gConfOut = Math.max(outPool.bmConf, outPool.semConf);
     for (const i of outIdx) {
       const u = store.units[i];
       const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
       const h = hOf(outPool, i);
-      const score = federatePenalty * (wGraph * g + wHier * h);
+      const score = federatePenalty * (wGraph * g * gConfOut + wHier * h);
       if (score <= 0) continue;
       cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h, true) });
     }
@@ -886,14 +1131,31 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   }
   for (const a of bySessionTurn.values()) a.sort((x, y) => x.timestamp - y.timestamp);
 
-  const have = new Map(cands.map((c) => [c.unit.id, c]));
-  for (const c of [...cands]) {
+  // v0.13: seed closure only from candidates ABOVE minScore. Previously a
+  // candidate with a positive-but-sub-threshold score (e.g. 0.03 vs floor 0.15)
+  // sat in `have` and BLOCKED closure from pulling that unit in at a discounted
+  // score — dead candidates shadowed the very evidence closure exists to rescue.
+  // (With minScore 0 — as the evals run — this filter is a no-op.)
+  const seedCands = cands.filter((c) => c.score > minScore);
+  const have = new Map(seedCands.map((c) => [c.unit.id, c]));
+  // v0.13: closure admission gate — neighbors must obey the same rules the main
+  // pool does: current-session recent-exclusion (closure used to re-admit units
+  // the main loop had just excluded) and project scoping for adjacent turns
+  // (a cross-project federated hit used to be able to pull its same-session —
+  // also cross-project — neighbors back in, sidestepping the scoping).
+  const closureOk = (u: TraceUnit): boolean => {
+    if (opts.sessionId && u.sessionId === opts.sessionId && u.timestamp >= cutoff) return false;
+    if (scopeToProject && u.cwd !== opts.cwd) return false;
+    if (opts.activeContext?.has(u.fp)) return false; // v0.3: don't pull in-context evidence back in via closure
+    return true;
+  };
+  if (opts.useClosure !== false) {
+  for (const c of seedCands) {
     for (const nid of store.graph.neighbors(c.unit.id)) {
       if (have.has(nid)) continue;
       const nu = store.units.find((u) => u.id === nid);
       if (!nu) continue;
-      if (scopeToProject && nu.cwd !== opts.cwd) continue;
-      if (opts.activeContext?.has(nu.fp)) continue; // v0.3: don't pull in-context evidence back in via closure
+      if (!closureOk(nu)) continue;
       have.set(nid, { idx: -1, unit: nu, score: c.score * 0.35, reason: "closure:shared-entity" });
     }
     const arr = bySessionTurn.get(c.unit.sessionId);
@@ -902,10 +1164,11 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
       for (const delta of [-1, 1]) {
         const nb = arr[pos + delta];
         if (!nb || have.has(nb.id)) continue;
-        if (opts.activeContext?.has(nb.fp)) continue; // v0.3: don't pull in-context evidence back in via closure
+        if (!closureOk(nb)) continue;
         have.set(nb.id, { idx: -1, unit: nb, score: c.score * 0.25, reason: "closure:adjacent-turn" });
       }
     }
+  }
   }
 
   const seenFp = new Set<string>();
@@ -927,6 +1190,24 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   return picked.slice(0, topK).map((c) => ({ unit: c.unit, score: c.score, reason: c.reason }));
 }
 
+/** v0.13: neutralize structurally dangerous text before it enters the system
+ *  prompt. Stored memory includes tool results that read untrusted files, so a
+ *  hostile repo could plant instructions that persist across sessions and run
+ *  with system-prompt authority. Deterministic hygiene: strip code fences and
+ *  markdown heading/bullet/blockquote markers so injected text can't restructure
+ *  the prompt, and cap length. (The header already declares the block
+ *  non-authoritative; this removes the formatting leverage.) */
+export function sanitizeSnippet(text: string, snippetChars: number): string {
+  let s = text
+    .replace(/```/g, "'''")           // no fence spoofing
+    .replace(/^#{1,6}\s+/gm, "")      // no headings
+    .replace(/^\s*[-*+>]\s+/gm, "")   // no bullets/quotes at line starts
+    .replace(/\s+/g, " ")
+    .trim();
+  if (s.length > snippetChars) s = s.slice(0, snippetChars).trimEnd() + "…";
+  return s;
+}
+
 export function formatEvidence(hits: Hit[], snippetChars = 220): string {
   if (!hits.length) return "";
   const lines = [
@@ -934,11 +1215,32 @@ export function formatEvidence(hits: Hit[], snippetChars = 220): string {
   ];
   for (const h of hits) {
     const u = h.unit;
-    const snip = u.text.replace(/\s+/g, " ").trim().slice(0, snippetChars);
+    const snip = sanitizeSnippet(u.text, snippetChars);
     const sess = u.sessionName ? ` • "${u.sessionName}"` : "";
     lines.push(`- [${relTime(u.timestamp)}${sess} • ${h.reason}] ${snip}`);
   }
   return lines.join("\n");
+}
+
+/** v0.13: strict numeric env parsing. `Number(x) || def` silently turned `0`
+ *  into the default and `abc`/"" into NaN (which then poisoned MMR λ); this
+ *  returns the default for anything that isn't a finite number. */
+export function parseEnvNum(raw: string | undefined, def: number, clamp?: [number, number]): number {
+  if (raw === undefined || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return def;
+  if (clamp) return Math.min(clamp[1], Math.max(clamp[0], n));
+  return n;
+}
+/** v0.13: like parseEnvNum but returns undefined when unset/invalid, for
+ *  optional overrides (e.g. ZERO_MEM_MMR_LAMBDA — NaN used to slip through
+ *  `NaN ?? adaptive` because NaN is not nullish and silently disabled MMR). */
+export function parseEnvNumOpt(raw: string | undefined, clamp?: [number, number]): number | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return undefined;
+  if (clamp) return Math.min(clamp[1], Math.max(clamp[0], n));
+  return n;
 }
 
 // ── Answer-level calibration (v0.6) ───────────────────────────────────────────

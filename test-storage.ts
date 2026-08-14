@@ -93,8 +93,11 @@ check(store2.units.length === 50, "retention trims to maxUnits", `(${store2.unit
 
 // 5. end-to-end retrieval after reload (BM25 path). recentExcludeMs:0 because the
 // synthetic units above are all "recent" and would be (correctly) recency-guarded.
-const hits = await retrieve("widgets", store2, { cwd, topK: 5, recentExcludeMs: 0 });
-check(hits.length > 0, "retrieval functional after reload", `(${hits.length} hits)`);
+// v0.14b: query a SPECIFIC unit — "widgets" alone matches all 50 survivors
+// identically (idf≈0, zero discrimination), which pool-confidence now correctly
+// gates out instead of injecting arbitrary docs.
+const hits = await retrieve("unit 42 gadgets", store2, { cwd, topK: 5, recentExcludeMs: 0 });
+check(hits.length > 0, "retrieval functional after reload", `(${hits.length} hits, top: ${hits[0]?.unit.text.slice(0, 20) ?? "none"})`);
 
 // 6. legacy inline-embedding store migrates to sidecar on first persist
 console.log("\n" + "=".repeat(70));
