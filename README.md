@@ -286,6 +286,22 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
+**v0.14g** — fourth live bug (the "Cipher" transcript): "whats you name?" /
+"whats your name?" in a new session answered "I'm Pi" although the naming
+evidence ("call me **Cipher**", "you asked me to go by **Cipher**") was in the
+store — cross-project, like v0.14c. Five fixes: (1) typo variants ("you name"/
+"ur name") now engage the identity machinery; (2) "go by X" naming phrasings
+recognized (user- and self-naming); (3) "my name" evidence must be a naming
+STATEMENT — the user's question units stopped outranking mark's answer;
+(4) name-CENTRALITY grading: a unit that merely QUOTES a naming statement (an
+"E2E test complete" summary embedding the injected snippet) matches the same
+regexes but buries the name past the 120-char snippet where the reader never
+sees it — the perspective boost now scales with how early the naming phrase
+appears, so source statements beat quotations; (5) identity-query demotion
+×0.6→×0.4. Verified end-to-end on the real store (all four query phrasings rank
+the original naming statement first) + verbatim transcript regression test
+(`test-relevance.ts` §7); 11 files / 86 assertions green.
+
 **v0.14f** — calibration made provably harmless: paired significance on the v0.14e
 finding (permutation p=0.093 — directional, not significant; EM p=0.5; hit@10
 identical), and the Eq-15 answer-type boost is now **tie-only** (secondary sort

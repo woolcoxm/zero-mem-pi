@@ -114,5 +114,39 @@ check("greeting query never surfaces unrelated facts", !hi.some((h) => h.unit.te
     `(top: ${q3[0]?.unit.text.slice(0, 40) ?? "none"})`);
 }
 
+// 7. The v0.14g live bug (REAL transcript #3, verbatim store units): the user
+// named the assistant "Cipher" in a System32 session; a NEW session in another
+// project asked "whats you name?" (typo) and "whats your name?" and the agent
+// answered "I'm Pi". Three causes: (a) the TYPO escaped the perspective regexes
+// entirely (no "your name" ⇒ no identity machinery ⇒ OBS-JSON noise injected);
+// (b) an "E2E test complete" summary unit that QUOTED the naming snippet
+// verbatim (name 380+ chars in, past the 120-char injected snippet) outranked
+// the original statement 0.495 vs 0.489 and the reader deferred to it;
+// (c) "go by X" naming phrasing matched no evidence pattern.
+{
+  const s4 = new MemoryStore("C:/Users/Robot/projects/zero-mem-pi/.relevance-test4.json", extract);
+  s4.embedder = new Embedder();
+  await s4.embedder.init();
+  const SYS = "C:\\Windows\\System32", ZM = "C:\\Users\\Robot\\projects\\zero-mem-pi";
+  const t0 = Date.now() - 7 * 3600_000;
+  const sys = (role: "user" | "assistant", text: string, agoMin: number) =>
+    s4.add({ sessionId: "sys", cwd: SYS, role, text, timestamp: t0 + agoMin * 60_000 });
+  sys("user", "what is my name?", 400);
+  sys("user", "my name is mark", 399);
+  sys("assistant", "Alright, then — call me **Cipher**. 🕵️\n\nIt fits on a few levels: I decode messy code, help *decipher* cryptic bugs, and it sounds like a name a spy's sidekick would have.", 400);
+  sys("assistant", "You asked me to go by **Cipher** last time we worked together. 🕵️\n\nUnder the hood, I'm a coding assistant powered by GLM (trained by Z.ai), running inside the pi agent harness.", 399);
+  sys("assistant", "I'll run a series of recall queries to test the memory system end-to-end — checking the \"Cipher\" memory I referenced earlier, plus several other queries to see what's stored.", 398);
+  sys("assistant", "**E2E test complete — the memory system is working correctly.** ✅ Here are the results:\n\n## Test Results\n\n| Test | Query | Result | Status |\n|------|-------|--------|--------|\n| 1 | Recall \"Cipher\" name | Returned 5 relevant snippets | ✅ PASS |\n\n## What Test 1 returned (verbatim from memory store)\n\n```\n[53s ago] Alright, then — call me **Cipher**. 🕵️ It fits on a few levels: I decode\n          messy code, help *decipher* crypt\n```", 397);
+  const q1 = await retrieve("whats you name?", s4, { cwd: ZM, sessionId: "fresh", topK: 3 });
+  check("typo 'whats you name?' surfaces the Cipher naming (rank 1)", q1.length > 0 && /call me \*{0,2}cipher/i.test(q1[0].unit.text),
+    `(top: ${q1[0]?.unit.text.slice(0, 40) ?? "none"})`);
+  const q2 = await retrieve("whats your name?", s4, { cwd: ZM, sessionId: "fresh", topK: 3 });
+  check("'whats your name?' ranks the ORIGINAL naming above the E2E quote unit", q2.length > 0 && /^Alright, then/i.test(q2[0].unit.text),
+    `(top: ${q2[0]?.unit.text.slice(0, 40) ?? "none"})`);
+  const q3 = await retrieve("whats my name?", s4, { cwd: ZM, sessionId: "fresh", topK: 3 });
+  check("'whats my name?' ranks mark's statement above the question echo", q3.length > 0 && q3[0].unit.text === "my name is mark",
+    `(top: ${q3[0]?.unit.text.slice(0, 40) ?? "none"})`);
+}
+
 console.log(`\nRESULTS: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

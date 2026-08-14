@@ -873,27 +873,45 @@ export function evidenceCompat(query: string, text: string): number {
  *      possibly conflicting echo (−0.5). */
 export function perspectiveCompat(query: string, unit: { role: Role; text: string }): number {
   const q = query.toLowerCase(), t = unit.text.toLowerCase();
-  const asksAboutYou = /\byour name\b|\byou (are|'re|re) called\b|\bwhat should i call you\b/.test(q);
+  // v0.14g: "you name"/"ur name" typo variants — a live query ("whats you
+  // name?") escaped the entire perspective system and injected JSON noise.
+  const asksAboutYou = /\byour name\b|\byou name\b|\bur name\b|\byou (are|'re|re) called\b|\bwhat should i call you\b/.test(q);
   const asksAboutMe = /\bmy name\b|\bwho am i\b|\bwhat did i say\b|\bi (am|'m|m) called\b/.test(q);
   if (asksAboutYou && !asksAboutMe) {
     // (a) the user ASSIGNS the assistant a name ("your name is X" — including the
-    // "name's" contraction — "I'll call you X", "I named you X"). Asking isn't evidence.
+    // "name's" contraction — "I'll call you X", "I named you X", "you should go
+    // by X"). Asking isn't evidence. v0.14g: "go by" phrasing — the live Cipher
+    // transcript's naming evidence ("you asked me to go by Cipher") matched none
+    // of the earlier patterns.
     const userNamesAssistant = unit.role === "user" &&
-      /\byour name('?s| is|=)\b|\byou (are|'re|re|will be|'ll be) called\b|\b(i'?ll| will| can| should)?\s?(call|name|named|naming) you\b/.test(t);
+      /\byour name('?s| is|=)\b|\byou (are|'re|re|will be|'ll be) called\b|\b(i'?ll| will| can| should)?\s?(call|name|named|naming) you\b|\b(go|goes|going) by\b/.test(t);
     // (b) the assistant names ITSELF ("my name is X", "I'm called X", "call me X",
-    // "I named myself X" — even when the name itself appears elsewhere in the
-    // unit, e.g. "I'm Echo. I named myself that last session").
+    // "I go by X", "I named myself X" — even when the name itself appears elsewhere
+    // in the unit, e.g. "I'm Echo. I named myself that last session").
     const namesItself = /\bmy name('?s| is|=)\s/.test(t) || /\bi (am|'m) called\b/.test(t) ||
-      (/\b(call me|i named myself|name myself)\b/.test(t) && !/\bcall me (whatever|anything|something|that|this)\b/.test(t));
+      (/\b(call me|i named myself|name myself|go by|goes by)\b/.test(t) && !/\bcall me (whatever|anything|something|that|this)\b/.test(t));
     // Stale DENIALS ("I don't have a personal name", "no custom name set", "call
     // me whatever") are explicitly incompatible — they were outranking the real
     // naming evidence on the live store.
     const deniesName = /\b(don'?t|do not|doesn'?t) have (a |any )?(personal |custom )?name\b|\bno (personal |custom )?name\b|\bname is(n'?t| not) set\b|\bcall me (whatever|anything|something)\b/.test(t);
     const assistantNamesSelf = unit.role === "assistant" && namesItself && !deniesName;
-    return userNamesAssistant || assistantNamesSelf ? 1 : -1;
+    if (userNamesAssistant || assistantNamesSelf) {
+      // v0.14g: name CENTRALITY. A unit that QUOTES a naming statement verbatim
+      // (live case: an "E2E test complete" summary embedding the injected
+      // snippet) matches the same patterns but buries the name 380+ chars in —
+      // past the 120-char injected snippet, where the reader never sees it — and
+      // outranked the original on the live store. Grade the boost by how EARLY
+      // the naming phrase appears: source statements beat quotations.
+      const pos = t.search(/\bmy name('?s| is|=)\s|\bi (am|'m) called\b|\bcall me\b|\bi named myself\b|\bname myself\b|\b(go|goes|going) by\b|\byour name('?s| is|=)\b|\byou (are|'re|re|will be|'ll be) called\b|\b(call|name|named|naming) you\b/);
+      return pos < 0 ? 1 : Math.max(0.2, 1 - pos / 600);
+    }
+    return -1;
   }
   if (asksAboutMe) {
-    if (unit.role === "user" && /\bmy name\b|\bi (am|'m|m) called\b/.test(t)) return 1;
+    // v0.14g: evidence must be a naming STATEMENT ("my name is X", "I'm called
+    // X") — the old /\bmy name\b/ pattern gave +1 to the user's QUESTION units
+    // ("whats my name?"), which then outranked the actual statement.
+    if (unit.role === "user" && /\bmy name('?s| is|=)\s|\bi (am|'m|m) called\b/.test(t)) return 1;
     if (/\byour name\b|\byou (are|'re|re) called\b/.test(t)) return -0.5; // assistant's restatement of the user's name — echo, not source
   }
   return 0; // no perspective signal → neutral
@@ -906,7 +924,8 @@ export function perspectiveCompat(query: string, unit: { role: Role; text: strin
  *  "name" fields in-project and the real "my name is mark" unit never surfaced. */
 export function identityQuery(query: string): boolean {
   const q = query.toLowerCase();
-  return /\bmy name\b|\byour name\b|\bwho am i\b|\bwho are you\b|\bwhat should i call you\b|\bwhat did i say\b|\byou (are|'re|re) called\b|\bi (am|'m|m) called\b/.test(q);
+  // v0.14g: "you name"/"ur name" typo variants (live query "whats you name?").
+  return /\bmy name\b|\byour name\b|\byou name\b|\bur name\b|\bwho am i\b|\bwho are you\b|\bwhat should i call you\b|\bwhat did i say\b|\byou (are|'re|re) called\b|\bi (am|'m|m) called\b/.test(q);
 }
 
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
@@ -1130,7 +1149,12 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     const pc = perspectiveCompat(query, u);
     let score = wGraph * g * gConf + wHier * h + 0.3 * pc;
     if (pc < 0) score = Math.min(score, minScore * 0.9); // incompatible: cap under the floor
-    else if (pc === 0 && idQ) score *= 0.6;               // identity query, non-identity evidence: demote
+    // v0.14g: demotion ×0.6→×0.4 — live Cipher bug: an "E2E test complete"
+    // memory-system summary unit (vocabulary-adjacent: queries, results, names)
+    // outranked the actual "call me Cipher" naming statement 0.495 vs 0.489 and
+    // the reader answered "Still Pi!". Non-identity chatter on identity queries
+    // is at best tangential; naming statements (pc≠0) are exempt.
+    else if (pc === 0 && idQ) score *= 0.4;               // identity query, non-identity evidence: demote
     if (score <= 0) continue;
     cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h) });
   }
@@ -1160,7 +1184,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
         const pc = perspectiveCompat(query, u);
         let score = federatePenalty * (wGraph * g * gConfOut + wHier * h) + 0.3 * pc;
         if (pc < 0) score = Math.min(score, minScore * 0.9);
-        else if (pc === 0 && idQ) score *= 0.6;
+        else if (pc === 0 && idQ) score *= 0.4; // v0.14g: keep in-project/cross demotion symmetric
         if (score <= 0) continue;
         cross.push({ idx: i, unit: u, score, reason: reasonFor(g, h, true) });
       }
