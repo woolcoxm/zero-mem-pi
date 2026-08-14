@@ -778,19 +778,19 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   // when an embedder is loaded — so retrieve can HYBRID-fuse them. Each signal is
   // normalized by its OWN per-pool max so in-project and cross-project hits are each
   // comparable to 1.0 before the federation penalty, and lexical/dense share a scale.
-  const scorePool = (idx: number[]): { bm: Map<number, number>; bmMax: number; sem: Map<number, number>; semMax: number } => {
+  const scorePool = (idx: number[]): { bm: Map<number, number>; bmMax: number; bmMin: number; sem: Map<number, number>; semMax: number; semMin: number } => {
     const bm = new Map<number, number>(), sem = new Map<number, number>();
-    let bmMax = 0, semMax = 0;
+    let bmMax = 0, bmMin = Infinity, semMax = 0, semMin = Infinity;
     for (const i of idx) {
       const u = store.units[i];
-      const b = store.bm25.score(qTokens, i); bm.set(i, b); if (b > bmMax) bmMax = b;
+      const b = store.bm25.score(qTokens, i); bm.set(i, b); if (b > bmMax) bmMax = b; if (b < bmMin) bmMin = b;
       let s = 0;
       if (useEmb && qEmb && u.embedding && u.embedding.length) {
         s = (semCand && !semCand.has(i)) ? 0 : (cosine(qEmb, u.embedding) + 1) / 2; // cosine [-1,1] → [0,1]
       }
-      sem.set(i, s); if (s > semMax) semMax = s;
+      sem.set(i, s); if (s > semMax) semMax = s; if (s < semMin) semMin = s;
     }
-    return { bm, bmMax, sem, semMax };
+    return { bm, bmMax, bmMin, sem, semMax, semMin };
   };
   // v0.9: hybrid fusion. v0.8 used dense-ALONE when an embedder was loaded (discarding
   // BM25), which LoCoMo10 showed UNDERPERFORMS BM25 on real factual lookups (r@5 0.27
@@ -803,11 +803,15 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   const fusion: "weighted" | "max" | "coverage" = opts.fusion ?? "coverage";
   const semW = Math.min(1, Math.max(0, opts.semanticWeight ?? 0.5));
   const lexW = 1 - semW;
-  type Pool = { bmMax: number; bm: Map<number, number>; semMax: number; sem: Map<number, number> };
+  type Pool = { bmMax: number; bmMin: number; bm: Map<number, number>; semMax: number; semMin: number; sem: Map<number, number> };
+  // v0.11: min-max normalization per signal (paper Eq 12), not max-norm. BM25's min is
+  // ~0 so it's ~unchanged, but dense cosines cluster in [0.5,1]; min-max stretches that
+  // to [0,1], restoring discrimination that max-norm compressed away.
+  const mmN = (v: number, lo: number, hi: number) => hi > lo ? (v - lo) / (hi - lo) : (v > 0 ? 1 : 0);
   const hOf = (pool: Pool, i: number): number => {
-    const bN = pool.bmMax ? (pool.bm.get(i) ?? 0) / pool.bmMax : 0;
-    if (!hybrid) return useEmb ? (pool.semMax ? (pool.sem.get(i) ?? 0) / pool.semMax : 0) : bN; // v0.8
-    const sN = pool.semMax ? (pool.sem.get(i) ?? 0) / pool.semMax : 0;
+    const bN = mmN(pool.bm.get(i) ?? 0, pool.bmMin, pool.bmMax);
+    if (!hybrid) return useEmb ? mmN(pool.sem.get(i) ?? 0, pool.semMin, pool.semMax) : bN; // v0.8
+    const sN = mmN(pool.sem.get(i) ?? 0, pool.semMin, pool.semMax);
     if (fusion === "max") return Math.max(bN, sN);
     if (fusion === "coverage") return cov * bN + (1 - cov) * sN; // trust lexical when query terms match the corpus
     return lexW * bN + semW * sN; // weighted
@@ -822,8 +826,8 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   else if (temporal) wGraph = Math.max(0.3, rho - 0.2);
   const wHier = 1 - wGraph;
 
-  let gMax = 0;
-  for (const v of gRaw.values()) if (v > gMax) gMax = v;
+  let gMax = 0, gMin = Infinity;
+  for (const v of gRaw.values()) { if (v > gMax) gMax = v; if (v < gMin) gMin = v; }
 
   type Cand = { idx: number; unit: TraceUnit; score: number; reason: string };
   const hLabel = hybrid ? `hybrid:${fusion}` : (useEmb ? "semantics" : "lexical");
@@ -834,7 +838,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   const cands: Cand[] = [];
   for (const i of inIdx) {
     const u = store.units[i];
-    const g = gMax ? (gRaw.get(u.id) ?? 0) / gMax : 0;
+    const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
     const h = hOf(inPool, i);
     const score = wGraph * g + wHier * h;
     if (score <= 0) continue;
@@ -851,7 +855,7 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     const federatePenalty = opts.federatePenalty ?? 0.7;
     for (const i of outIdx) {
       const u = store.units[i];
-      const g = gMax ? (gRaw.get(u.id) ?? 0) / gMax : 0;
+      const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
       const h = hOf(outPool, i);
       const score = federatePenalty * (wGraph * g + wHier * h);
       if (score <= 0) continue;
