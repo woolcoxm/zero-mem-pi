@@ -1224,11 +1224,15 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     .sort((a, b) => b.score - a.score)
     .filter((c) => { if (seenFp.has(c.unit.fp)) return false; seenFp.add(c.unit.fp); return true; }); // v0.3: de-dup near-identical evidence
   // v0.11: evidence calibration (paper Eq 15) — re-rank admissible evidence by
-  // answer-type compatibility as a small boost (breaks near-ties toward type-matching
-  // evidence: temporal queries favor units containing dates, quantity → numbers).
+  // answer-type compatibility (temporal → dates, quantity → numbers).
+  // v0.14f: the boost now breaks TIES ONLY (secondary sort key). The flat +0.15
+  // boost (v0.11–v0.14e) let any date/number-containing unit displace strictly
+  // better-matched evidence: reader-F1 ablation measured −3.4 F1 pts end-to-end
+  // (paired permutation p=0.093, n=100 — directional, not decisive), while its
+  // retrieval-MRR gain was +0.008. Tie-only ordering can never displace, so
+  // calibration stays ON by default, harmless by construction.
   if (opts.calibrateEvidence ?? true) {
-    const cw = 0.15;
-    ranked.sort((a, b) => (b.score + cw * evidenceCompat(query, b.unit.text)) - (a.score + cw * evidenceCompat(query, a.unit.text)));
+    ranked.sort((a, b) => (b.score - a.score) || (evidenceCompat(query, b.unit.text) - evidenceCompat(query, a.unit.text)));
   }
   // v0.7: MMR diversifies the injected set so top-K isn't several near-duplicate
   // snippets. Diversify from a pool larger than topK, then select topK.

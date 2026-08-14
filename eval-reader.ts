@@ -26,7 +26,7 @@
  *   default, BRIDGES=0, CLOSURE=0, CALIB=0 — and compare answer F1 deltas.
  */
 import { MemoryStore, Embedder, makeExtractor, retrieve, formatEvidence } from "./core.ts";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 
 const ENDPOINT = process.argv[2] ?? "http://127.0.0.1:8080/v1";
 const EMB_MODEL = process.argv[3] ?? "Xenova/bge-small-en-v1.5";
@@ -43,6 +43,8 @@ const ABL: { useBridges?: boolean; useClosure?: boolean; calibrateEvidence?: boo
 if (process.env.BRIDGES === "0") ABL.useBridges = false;
 if (process.env.CLOSURE === "0") ABL.useClosure = false;
 if (process.env.CALIB === "0") ABL.calibrateEvidence = false;
+const DUMP = process.env.DUMP ?? ""; // v0.14e: per-QA JSONL dump tag for paired stats
+const rows: any[] = [];
 
 // ── SQuAD-style scoring (deterministic) ─────────────────────────────────────
 const norm = (s: any) => String(s ?? "").toLowerCase().replace(/\b(a|an|the)\b/g, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
@@ -140,14 +142,20 @@ for (let s = 0; s < sampled.length; s++) {
     const gold = new Set<string>(q.evidence ?? []);
     const hit = hits.some((h) => gold.has(dia.get(h.unit.id) ?? "")) ? 1 : 0;
     const a = acc, ca = cat(q.category); a.n++; ca.n++; a.hit += hit; ca.hit += hit;
+    let pred = "";
     if (up) {
       const context = hits.map((h) => `[${dateOf.get(h.unit.id) ?? ""}] ${h.unit.text.slice(0, 200)}`).join("\n");
-    let pred = ""; try { pred = await llmAnswer(ENDPOINT, model, context, q.question); } catch (e: any) { pred = `__err:${(e?.message ?? "").slice(0, 40)}`; }
+    try { pred = await llmAnswer(ENDPOINT, model, context, q.question); } catch (e: any) { pred = `__err:${(e?.message ?? "").slice(0, 40)}`; }
     const f = f1(pred, q.answer ?? ""), e = em(pred, q.answer ?? ""), b = bleu1(pred, q.answer ?? "");
     a.f1 += f; a.em += e; a.bleu += b; ca.f1 += f; ca.em += e; ca.bleu += b;
   }
+    // v0.14e: per-QA dump for PAIRED significance tests between ablation runs
+    // (same seed ⇒ same questions in the same order). DUMP=<tag> writes
+    // .reader-<tag>.jsonl; analyze with eval-reader-stats.mjs.
+    if (DUMP) rows.push({ i: s, ci, cat: q.category, q: String(q.question ?? "").slice(0, 160), gold: q.answer ?? "", pred, f1: pred ? f1(pred, q.answer ?? "") : 0, em: pred ? em(pred, q.answer ?? "") : 0, bleu: pred ? bleu1(pred, q.answer ?? "") : 0, hit, ablation: `${ABL.useBridges === false ? "nograph" : "graph"}/${ABL.useClosure === false ? "noclosure" : "closure"}/${ABL.calibrateEvidence === false ? "nocalib" : "calib"}` });
   if ((s + 1) % 10 === 0) process.stdout.write(`  ${s + 1}/${sampled.length}\n`);
 }
+if (DUMP) { writeFileSync(`.reader-${DUMP}.jsonl`, rows.map((r) => JSON.stringify(r)).join("\n") + "\n"); console.log(`[reader] per-QA results → .reader-${DUMP}.jsonl (${rows.length})`); }
 for (const s of storeCache.values()) try { rmSync((s.store as any).path, { force: true }); } catch {}
 
 const p = (x: number) => (x).toFixed(3);

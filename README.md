@@ -244,14 +244,20 @@ reader; 100-QA seeded sample, paired runs, temp 0):**
 
 Read: the **graph is neutral** at reader level too (matching retrieval-level
 neutrality); **closure is mildly positive** (+0.8 F1 pts — same direction as the
-paper's +4.2 on HotpotQA, smaller magnitude); and **evidence calibration as
-implemented is net-negative** (−3.4 pts): its surface date/number boost displaces
-better evidence on multi-session questions (cat2 F1 0.036 → 0.237 with it off).
-Calibration helped retrieval MRR (0.396 → 0.404 in v0.11) but hurts the reader —
-the two metrics disagree, which is exactly why this eval exists. Caveats: n=100,
-no significance test yet, and 24/100 adversarial questions score ~0 under strict
-RAG by construction (the earlier Qwen3-Coder 0.200 was a different, easier 50-QA
-sample). The paired deltas are the signal, not the absolutes.
+paper's +4.2 on HotpotQA, smaller magnitude); and the **flat evidence-calibration
+boost looked net-negative** (−3.4 pts, cat2 0.036 → 0.237 with it off) — but the
+paired test says **directional, not decisive**: permutation p=0.093 on per-QA F1,
+EM McNemar p=0.5, hit@10 identical (b=0 c=0 — calibration never moved gold across
+the top-10 boundary; its whole effect is context ORDER). Calibration helped
+retrieval MRR (0.396 → 0.404 in v0.11) while hurting the reader — the metrics
+disagree, which is why this eval exists. **v0.14f response:** the Eq-15 boost is
+now **tie-only** (secondary sort key — can order equally-scored evidence, can
+never displace a strictly better match), default stays ON, verified: tie-only
+scores F1 0.136 / EM 0.070 ≈ calibration-off (0.132 / 0.070, p=1.0), recovering
+the full flat-boost gap (0.098 → 0.136). Caveats: n=100, and 24/100 adversarial
+questions score ~0 under strict RAG by construction (the earlier Qwen3-Coder
+0.200 was a different, easier 50-QA sample). The paired deltas are the signal,
+not the absolutes.
 
 ## Tests
 
@@ -279,6 +285,14 @@ Requires Node ≥ 22 (for `--experimental-strip-types`). The live MiniLM embedde
 loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB).
 
 ## Status
+
+**v0.14f** — calibration made provably harmless: paired significance on the v0.14e
+finding (permutation p=0.093 — directional, not significant; EM p=0.5; hit@10
+identical), and the Eq-15 answer-type boost is now **tie-only** (secondary sort
+key, cannot displace better evidence). Default stays ON; verified reader-level ≈
+calibration-off (F1 0.136 vs 0.132, p=1.0) while recovering the flat-boost gap
+(0.098 → 0.136). New tooling: per-QA dumps (`DUMP=<tag>`) + `eval-reader-stats.mjs`
+(paired permutation + exact McNemar).
 
 **v0.14e** — ran the reader-F1 ablation experiment (Qwen2.5-14B-Instruct, the
 paper's open-weights reader): **graph neutral, closure +0.8 F1 pts, evidence

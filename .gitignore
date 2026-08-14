@@ -9,3 +9,4 @@ store.json
 .locomo10.json
 .locomo10.json.run-*.json
 .zm-*-test.json
+.reader-*.jsonl
