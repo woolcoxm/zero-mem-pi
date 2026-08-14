@@ -119,8 +119,15 @@ const run = async (label: string, opts: any) => {
 
 console.log("config                              recall@1  recall@3  recall@5   MRR");
 console.log("-".repeat(80));
-const bm = await run("BM25 only (no embeddings)", { hybrid: false, useHnsw: false });
-// no-embedder path: simulate by hiding the embedder readiness
+// TRUE BM25 baseline requires actually nulling the embedder: `hybrid:false`
+// alone runs the v0.8 dense-only path in core.ts (hOf) — the row this file
+// used to label "BM25 only" was dense+graph (r@5 0.647), UNDERSTATING the real
+// lexical baseline (0.682). eval.ts always did this correctly.
+const withNoEmbedder = async (label: string, opts: any) => {
+  const e = store.embedder; store.embedder = null;
+  try { return await run(label, opts); } finally { store.embedder = e; }
+};
+const bm = await withNoEmbedder("BM25 only (no embeddings)", { hybrid: false });
 const core = await run("FULL (coverage + PPR graph)", {});
 const noG = await run("FULL, graph=direct matches (no PPR)", { useBridges: false });
 

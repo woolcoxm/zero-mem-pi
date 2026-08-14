@@ -160,8 +160,14 @@ near-duplicate collisions, not toy distractors:
 
 | config | recall@5 | MRR |
 |---|---:|---:|
-| BM25 only | 0.652 | 0.364 |
+| BM25 only | 0.682 | 0.372 |
+| dense-only + graph (no lexical) | 0.647 | 0.361 |
 | coverage fusion + PPR | **0.695** | 0.378 |
+
+(Full margin over true BM25 is **+0.013** — real but small. The dense-only row
+is what this table mislabeled "BM25 only" before v0.14d: `hybrid:false` with a
+loaded embedder runs the v0.8 dense path, not BM25; the baseline now nulls the
+embedder like `eval.ts` always did.)
 
 Headline: the **coverage router** lifts recall@5 **0.75 → 0.96** over BM25 on
 synonym/paraphrase queries (v0.11's min-max lifted it to 0.98; v0.14b weak-pool
@@ -262,7 +268,8 @@ temporal run hierarchy-primary; primary gets ρ=0.6). Validated on LoCoMo:
 r@5 **0.543 → 0.546**, McNemar p ≈ 0.0009 vs BM25, no regressions elsewhere.
 Evals got honest: held-out conversation split reported (tuned 1–5 vs untouched
 6–10), and a new 200-fact hard-negative paraphrase eval (`eval-hard.ts`) where
-every fact has a one-value-different sibling (FULL 0.695 vs BM25 0.652).
+every fact has a one-value-different sibling (FULL 0.695 vs true BM25 0.682 —
+margin +0.013; see the v0.14d baseline fix).
 
 **v0.13** — audit-hardening release. A full review (code + evals, paper-fidelity check
 against arXiv:2607.29377) surfaced and fixed a cluster of *lifecycle* defects that could
