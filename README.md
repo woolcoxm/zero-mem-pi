@@ -239,16 +239,19 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
-**v0.14b** — live-bug fix: the "what is your name?" confusion. Weak retrieval pools
-(one matching term) were min-max-normalized into confident-looking garbage injections;
-now every pool carries a confidence (BM25 raw strength / dense cosine anchors) and
-weak pools inject **nothing** — "no memory" beats "confusing memory". Added
-**perspective compatibility** ("my name" vs "your name" queries are indistinguishable
-to BM25/embeddings — cos 0.71 vs 0.74 — but who speaks about whom discriminates), and
-robust session-id / active-context extraction across pi API shapes (both recency guards
-could silently miss, injecting seconds-old same-session chatter). Reproduced exactly in
-`test-relevance.ts`; 11 files / 71 assertions green; hard-negative eval unchanged
-(0.695); LoCoMo unchanged (0.546, p≈0.0009, same held-out split).
+**v0.14b/c** — live-bug fixes (three, each verified end-to-end on the real store):
+(1) weak retrieval pools (one matching term) were min-max-normalized into confident-looking
+garbage injections — pools now carry a confidence and weak pools inject **nothing**;
+(2) **perspective compatibility** ("my name" vs "your name" are indistinguishable to
+BM25/embeddings — cos 0.71 vs 0.74 — who speaks about whom discriminates), accepting
+user-naming AND assistant **self-naming** ("I'm Echo — I named myself") while suppressing
+stale denials; (3) identity queries from a *different project* ("whats my name?" while
+the name fact lives in another project's store) now **federate comparatively** — cross
+hits join when they clearly beat in-project noise (+0.15), and non-identity units
+(JSON "name" fields) are demoted on identity queries. Plus robust session-id /
+active-context extraction across pi API shapes. All three live transcripts are permanent
+regression tests (`test-relevance.ts`); 11 files / 80 assertions green; hard-negative
+eval unchanged (0.695); LoCoMo unchanged (0.546, p≈0.0009, same held-out split).
 
 **v0.14** — paper-fidelity release. The graph view now implements the paper's
 **Personalized PageRank propagation** (Eq 8–10: idf-weighted shared-entity unit

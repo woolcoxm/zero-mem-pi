@@ -899,6 +899,16 @@ export function perspectiveCompat(query: string, unit: { role: Role; text: strin
   return 0; // no perspective signal → neutral
 }
 
+/** v0.14c: is this an identity-class query (about the user's or the agent's
+ *  name/identity)? Used to demote units that merely share vocabulary ("name"
+ *  fields in JSON, OBS config) without being identity statements — live bug:
+ *  "whats my name?" from a different project matched a wall of OBS JSON
+ *  "name" fields in-project and the real "my name is mark" unit never surfaced. */
+export function identityQuery(query: string): boolean {
+  const q = query.toLowerCase();
+  return /\bmy name\b|\byour name\b|\bwho am i\b|\bwho are you\b|\bwhat should i call you\b|\bwhat did i say\b|\byou (are|'re|re) called\b|\bi (am|'m|m) called\b/.test(q);
+}
+
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
   store.ensureIndex();
 
@@ -1104,6 +1114,11 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
   // paper refines graph ranking with lexical/phrase matches, so PPR mass that
   // nothing lexical or semantic supports doesn't inject on its own.
   const gConf = Math.max(inPool.bmConf, inPool.semConf);
+  // v0.14c: identity-class queries ("whats my name?", "what is your name?")
+  // demote units that are NOT identity statements (perspective 0) — in-project
+  // JSON/tool chatter full of "name" fields kept outscoring the actual
+  // "my name is mark" unit living in another project.
+  const idQ = identityQuery(query);
   for (const i of inIdx) {
     const u = store.units[i];
     const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
@@ -1115,26 +1130,42 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     const pc = perspectiveCompat(query, u);
     let score = wGraph * g * gConf + wHier * h + 0.3 * pc;
     if (pc < 0) score = Math.min(score, minScore * 0.9); // incompatible: cap under the floor
+    else if (pc === 0 && idQ) score *= 0.6;               // identity query, non-identity evidence: demote
     if (score <= 0) continue;
     cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h) });
   }
-  // v0.9: cross-project federation — ONLY when the in-project pool has nothing
-  // above minScore (project scoping is too narrow). Cross-project hits are
-  // h-normalized within their OWN pool, then penalized so they rank below a
-  // real in-project answer of equal strength. The instant the current project
-  // answers the query, this block is skipped and nothing leaks across.
-  if ((opts.federate ?? true) && scopeToProject && outIdx.length > 0 &&
-      !cands.some((c) => c.score > minScore)) {
-    const outPool = scorePool(outIdx);
-    const federatePenalty = opts.federatePenalty ?? 0.7;
-    const gConfOut = Math.max(outPool.bmConf, outPool.semConf);
-    for (const i of outIdx) {
-      const u = store.units[i];
-      const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
-      const h = hOf(outPool, i);
-      const score = federatePenalty * (wGraph * g * gConfOut + wHier * h);
-      if (score <= 0) continue;
-      cands.push({ idx: i, unit: u, score, reason: reasonFor(g, h, true) });
+  // v0.9: cross-project federation. v0.14c: used to fire ONLY when the
+  // in-project pool had nothing above minScore — a live bug showed the failure
+  // mode: "whats my name?" from a different cwd matched in-project OBS/JSON
+  // "name" fields above minScore, so federation never fired and the real
+  // "my name is mark" unit (another project) was unreachable. Now federation
+  // ALSO fires when the best cross-project hit (after the penalty) CLEARLY
+  // beats the best in-project hit (+0.15) — a strong personal/identity fact
+  // elsewhere outranks mild in-project noise. A project with its own strong
+  // answer still never leaks: a penalized equal-strength cross hit can't clear
+  // the margin.
+  if ((opts.federate ?? true) && scopeToProject && outIdx.length > 0) {
+    const bestIn = cands.reduce((m, c) => Math.max(m, c.score), 0);
+    // Don't bother scoring the cross pool when in-project is decisively strong —
+    // a penalized cross hit can't realistically clear the margin from there.
+    if (bestIn <= Math.max(minScore, 0.45)) {
+      const outPool = scorePool(outIdx);
+      const federatePenalty = opts.federatePenalty ?? 0.7;
+      const gConfOut = Math.max(outPool.bmConf, outPool.semConf);
+      const cross: Cand[] = [];
+      for (const i of outIdx) {
+        const u = store.units[i];
+        const g = mmN(gRaw.get(u.id) ?? 0, gMin, gMax);
+        const h = hOf(outPool, i);
+        const pc = perspectiveCompat(query, u);
+        let score = federatePenalty * (wGraph * g * gConfOut + wHier * h) + 0.3 * pc;
+        if (pc < 0) score = Math.min(score, minScore * 0.9);
+        else if (pc === 0 && idQ) score *= 0.6;
+        if (score <= 0) continue;
+        cross.push({ idx: i, unit: u, score, reason: reasonFor(g, h, true) });
+      }
+      const bestOut = cross.reduce((m, c) => Math.max(m, c.score), 0);
+      if (bestIn <= minScore || bestOut > bestIn + 0.15) cands.push(...cross);
     }
   }
 

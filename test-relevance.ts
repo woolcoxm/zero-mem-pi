@@ -82,5 +82,37 @@ check("greeting query never surfaces unrelated facts", !hi.some((h) => h.unit.te
     `(top: ${nm2[0]?.unit.text.slice(0, 50) ?? "(none)"})`);
 }
 
+// 6. The v0.14c cross-project failure (REAL transcript #2): pi was started from
+// C:\Users\Robot\projects (a session full of OBS/PowerShell output with "name"
+// fields), while the identity facts live under the zero-mem-pi project. The
+// in-project OBS noise used to beat minScore, federation never fired, and
+// "whats my name?" got a wall of OBS JSON instead of the user's name.
+{
+  const s3 = new MemoryStore("C:/Users/Robot/projects/zero-mem-pi/.relevance-test3.json", extract);
+  s3.embedder = new Embedder();
+  await s3.embedder.init();
+  const PROJ = "C:\\other-project", t0 = Date.now() - 60 * 60_000;
+  const obs = (role: "user" | "assistant" | "tool", text: string, ago: number) =>
+    s3.add({ sessionId: "obs", cwd: PROJ, role, text, timestamp: t0 + ago * 1000 });
+  obs("tool", `{ "name": "Untitled", "DesktopAudioDevice1": { "prev_ver": 537001985, "name": "Desktop Audio", "uuid": "fa7aac82", "id": "wasapi_output_capture" } }`, 30 * 60);
+  obs("assistant", "At line:1 char:187 ... scenes\\Untitled.json' -Raw | ConvertFrom-Json; 'name=' + .name; You must provide a value expression following the '+' operator.", 26 * 60);
+  obs("assistant", "Case-insensitive duplicate: the scene `ZCode` and the window-capture source `Zcode` — OBS requires unique source names and choked.", 20 * 60);
+  const zm = (role: "user" | "assistant", text: string, ago: number) =>
+    s3.add({ sessionId: "zm", cwd, role, text, timestamp: t0 + ago * 1000 });
+  zm("user", "hi, my name is mark, ill let you decide your name", 55 * 60);
+  zm("assistant", "You're absolutely right, Mark — my apologies! I'm **Echo**. 🪶 I named myself that last session.", 40 * 60);
+
+  const q1 = await retrieve("whats my name?", s3, { cwd: PROJ, sessionId: "fresh", topK: 3 });
+  check("cross-project: 'whats my name?' surfaces the mark unit", q1.length > 0 && /my name is mark/.test(q1[0].unit.text),
+    `(top: ${q1[0]?.unit.text.slice(0, 40) ?? "none"})`);
+  check("cross-project hits are tagged", q1.some((h) => h.reason.includes("cross-project")));
+  const q2 = await retrieve("what is your name?", s3, { cwd: PROJ, sessionId: "fresh", topK: 3 });
+  check("cross-project: 'what is your name?' surfaces Echo", q2.length > 0 && /echo/i.test(q2[0].unit.text),
+    `(top: ${q2[0]?.unit.text.slice(0, 40) ?? "none"})`);
+  const q3 = await retrieve("OBS scene duplicate window capture", s3, { cwd: PROJ, sessionId: "fresh", topK: 3 });
+  check("non-identity in-project queries still answer locally", q3.length > 0 && q3[0].unit.cwd === PROJ,
+    `(top: ${q3[0]?.unit.text.slice(0, 40) ?? "none"})`);
+}
+
 console.log(`\nRESULTS: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);
