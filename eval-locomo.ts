@@ -74,7 +74,7 @@ const data = await loadDataset();
 const convs = (data as any[]);
 console.log(`[locomo] ${convs.length} conversations, ${convs.reduce((s, c) => s + c.qa.length, 0)} QA total`);
 
-const embedder = new Embedder(); await embedder.init();
+const embedder = new Embedder(process.argv[2], process.argv[3] as any); await embedder.init();
 console.log(`[locomo] embedder ready: ${embedder.ready}`);
 
 const bm = newAcc(), sem = newAcc(), hyb = newAcc(), core = newAcc();

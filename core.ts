@@ -251,8 +251,9 @@ export class Embedder {
   ready = false;
   dim = 384;
   private loading: Promise<void> | null = null;
-  model: string = "Xenova/bge-small-en-v1.5"; // v0.10: upgraded from MiniLM (LoCoMo pure-semantic r@5 0.27→0.42, much stronger discrimination)
-  constructor(model?: string) { if (model !== undefined) this.model = model; }
+  model: string = "Xenova/bge-small-en-v1.5"; // v0.10 default (proven). v0.11 note: the paper uses BGE-M3, but it underperformed bge-small with mean pooling on LoCoMo (r@5 0.20 vs 0.42) and is too slow for full eval on CPU (paper used a GPU). Configurable below for opt-in.
+  pooling: "mean" | "cls" = "mean"; // BGE-M3 prefers "cls" (mean crams near-matches); bge-small uses "mean"
+  constructor(model?: string, pooling?: "mean" | "cls") { if (model !== undefined) this.model = model; if (pooling) this.pooling = pooling; }
 
   async init(): Promise<void> {
     if (this.loading) return this.loading;
@@ -275,7 +276,7 @@ export class Embedder {
 
   async embed(text: string): Promise<number[] | null> {
     if (!this.ready || !this.pipe) return null;
-    const out = await this.pipe(text, { pooling: "mean", normalize: true });
+    const out = await this.pipe(text, { pooling: this.pooling, normalize: true });
     return Array.from(out.data as Float32Array);
   }
 }
