@@ -103,6 +103,9 @@ All via environment variables (set in your shell or `settings.json`):
 - `ZERO_MEM_HYBRID=0` — disable fusion (restore v0.8 dense-only; not recommended — underperforms BM25 on real data).
 - `ZERO_MEM_FEDERATE=0` — disable cross-project fallback (reach into other projects only when this one has nothing relevant).
 
+**Dense embedder (v0.10)**
+- `ZERO_MEM_EMBEDDER` — sentence-embedder model (default `Xenova/bge-small-en-v1.5`; was MiniLM through v0.9 — bge lifts LoCoMo pure-semantic r@5 0.27→0.42). The store re-embeds automatically if you change this.
+
 Code-level constants (`index.ts`/`core.ts`): `rho` (routing weight), closure discounts, `recentExcludeMs`, `scopeToProject`, `minScore`, BM25 `k1`/`b`.
 
 ## Performance
@@ -205,14 +208,12 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
-**v0.9** — cross-project federation (reach across projects when this one has nothing
-relevant), adaptive MMR λ (relevance-favoring for lookups, diversity-favoring for
-exploratory queries), HNSW incremental insert (fresh facts searchable at scale
-immediately, no waiting for the +50% rebuild), and a **retrieval eval on the real
-LoCoMo10 benchmark** that exposed and fixed a real deficiency: the v0.8 dense-only
-default underperformed BM25 on real data (r@5 0.273 vs 0.529). The fix is a
-**coverage router** that blends BM25 + dense by query lexical coverage — 0.534
-(≥ BM25) on LoCoMo, 0.92 on the paraphrase eval. 38/38 tests green. Remaining
-work (end-to-end F1/BLEU with an LLM reader, a stronger/conversational embedder
-or cross-encoder reranker to beat BM25 outright, incremental-HNSW quality) is in
+**v0.10** — everything in v0.9 plus: the **default embedder upgraded MiniLM → bge-small-en-v1.5**
+(pure-semantic LoCoMo r@5 0.27 → 0.42; the store auto-re-embeds on model change), an
+**end-to-end reader eval** (`eval-reader.ts`) running the paper's actual metric —
+retrieve → LLM answers → F1/EM/BLEU (50-QA sample w/ a local reader: F1 0.155 /
+EM 0.040 / BLEU-1 0.177), and **proven determinism** (embeddings bit-exact across
+runs — the earlier "variance" was a harness bug). 38/38 tests green. Remaining
+work (beat BM25 outright — coverage currently *ties* it; a cross-encoder
+reranker or conversational embedder; incremental-HNSW quality tuning) is in
 [`DESIGN.md`](./DESIGN.md).

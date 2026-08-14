@@ -31,7 +31,7 @@ export default async function (pi: ExtensionAPI) {
   const fusionMode = (process.env.ZERO_MEM_FUSION ?? "coverage") as "coverage" | "max" | "weighted"; // v0.9: coverage router (default) — BM25 for factual lookups, dense for paraphrase
   const calibrateOn = process.env.ZERO_MEM_CALIBRATE === "1"; // v0.6: opt-in answer calibration
   let lastInjection: { query: string; hits: Hit[] } | null = null; // v0.6: for calibrate()
-  store.embedder = new Embedder(); // v0.2; loads lazily on first retrieve
+  store.embedder = new Embedder(process.env.ZERO_MEM_EMBEDDER); // v0.10: ZERO_MEM_EMBEDDER overrides (default bge-small-en-v1.5; was MiniLM)
   let loaded = false;
   const ensureLoaded = async () => { if (!loaded) { store.load(); loaded = true; } };
 
