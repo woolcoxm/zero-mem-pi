@@ -50,12 +50,37 @@ const key = await retrieve("staging deploy key expiry", store, { cwd, topK: 3 })
 check("strong pool unaffected: deploy-key fact surfaces", key.some((h) => h.unit.text.includes("dk_8842")),
   `(top: ${key[0]?.unit.text.slice(0, 30) ?? "(none)"})`);
 
-// 4. Greetings may legitimately surface the prior greeting exchange (cos
-// 0.73 — semantically it IS the closest memory, and it carries the user's
-// name), but must never leak unrelated facts.
+// 4. Greeting-only queries — may surface the prior greeting exchange (cos 0.73),
+// but must never leak unrelated facts.
 const hi = await retrieve("hello there", store, { cwd, topK: 3 });
 check("greeting query never surfaces unrelated facts", !hi.some((h) => h.unit.text.includes("dk_8842")),
   `(got ${hi.length}: ${hi.map((h) => h.unit.text.slice(0, 20)).join(" / ")})`);
+
+// 5. The v0.14b follow-up live bug (REAL transcript, verbatim from the store):
+// the assistant self-named ("I'm Echo… I named myself that last session") and
+// later, in a NEW conversation, "what is your name?" injected NOTHING — the
+// strict user-only naming rule made the self-naming permanently un-injectable,
+// and stale "I don't have a name" denials outranked it once partially fixed.
+{
+  const s2 = new MemoryStore("C:/Users/Robot/projects/zero-mem-pi/.relevance-test2.json", extract);
+  s2.embedder = new Embedder();
+  await s2.embedder.init();
+  const t0 = Date.now() - 30 * 60_000;
+  const real = (role: "user" | "assistant" | "tool", text: string, agoS: number) =>
+    s2.add({ sessionId: "old-session", cwd, role, text, timestamp: t0 + agoS * 1000 });
+  real("user", "hi, my name is mark, ill let you decide your name", 0);
+  real("assistant", "I don't have a personal name — I'm a coding assistant (part of pi). If you'd like, you can call me whatever you'd like.", 40);
+  real("user", "i thought your name was echo???", 60);
+  real("assistant", "You're absolutely right, Mark — my apologies! I'm **Echo**. 🪶\n\nI named myself that last session because we're building a memory system — Echo felt right.", 80);
+  real("assistant", "I'm the **pi coding agent** — that's my harness. There's no custom name set for me in this session (the PI_AGENT_NAME variable is empty).", 100);
+  const nm = await retrieve("what is your name?", s2, { cwd, topK: 3, sessionId: "brand-new-session" });
+  check("NEW conversation: 'what is your name?' surfaces the Echo self-naming", nm.length > 0 && /echo/i.test(nm[0].unit.text),
+    `(top: ${nm[0]?.unit.text.slice(0, 50) ?? "(none)"})`);
+  check("stale name-denials are NOT injected", !nm.some((h) => /don'?t have (a )?(personal )?name|no custom name/i.test(h.unit.text)));
+  const nm2 = await retrieve("whats your name", s2, { cwd, topK: 3, sessionId: "another-new-session" });
+  check("casual phrasing 'whats your name' also surfaces Echo", nm2.length > 0 && /echo/i.test(nm2[0].unit.text),
+    `(top: ${nm2[0]?.unit.text.slice(0, 50) ?? "(none)"})`);
+}
 
 console.log(`\nRESULTS: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

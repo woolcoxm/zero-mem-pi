@@ -860,9 +860,14 @@ export function evidenceCompat(query: string, text: string): number {
  *  conflict. "my name" and "your name" queries are indistinguishable to BM25 and
  *  near-identical to the embedder (cos 0.71 vs 0.74) — the discriminator is WHO
  *  is speaking about WHOM:
- *    - "your name" query ⇒ compatible only with a USER-role unit that names the
- *      assistant ("I'll call you X", "your name is X" said BY the user). An
- *      assistant saying "your name is Henry." is naming the USER — incompatible.
+ *    - "your name" query ⇒ compatible evidence is either (a) a USER-role unit
+ *      that names the assistant ("I'll call you X", "your name is X" said BY the
+ *      user — asking isn't evidence), or (b) an ASSISTANT-role unit where the
+ *      assistant names ITSELF ("my name is X", "I'm called X", "I named myself
+ *      X"). (b) is not optional: a live follow-up bug showed the assistant had
+ *      self-named ("I'm Echo — I named myself that last session") and the strict
+ *      user-only rule made the name permanently un-injectable — the memory was
+ *      there and the agent still couldn't answer "what is your name?".
  *    - "my name" query ⇒ the user's own first-person statement is the direct
  *      evidence (+1); an assistant restating "your name is ..." is a weaker,
  *      possibly conflicting echo (−0.5). */
@@ -871,10 +876,21 @@ export function perspectiveCompat(query: string, unit: { role: Role; text: strin
   const asksAboutYou = /\byour name\b|\byou (are|'re|re) called\b|\bwhat should i call you\b/.test(q);
   const asksAboutMe = /\bmy name\b|\bwho am i\b|\bwhat did i say\b|\bi (am|'m|m) called\b/.test(q);
   if (asksAboutYou && !asksAboutMe) {
-    // "naming" = the user ASSIGNS a name ("your name is X", "I'll call you X") —
-    // merely ASKING ("what's your name?") is not evidence.
-    const userNamesAssistant = unit.role === "user" && /\byour name (is|=)\b|\byou are called\b|\byou'?re called\b|\b(i'?ll| will|can|should) call you\b|\bcall you [a-z]/.test(t);
-    return userNamesAssistant ? 1 : -1;
+    // (a) the user ASSIGNS the assistant a name ("your name is X" — including the
+    // "name's" contraction — "I'll call you X", "I named you X"). Asking isn't evidence.
+    const userNamesAssistant = unit.role === "user" &&
+      /\byour name('?s| is|=)\b|\byou (are|'re|re|will be|'ll be) called\b|\b(i'?ll| will| can| should)?\s?(call|name|named|naming) you\b/.test(t);
+    // (b) the assistant names ITSELF ("my name is X", "I'm called X", "call me X",
+    // "I named myself X" — even when the name itself appears elsewhere in the
+    // unit, e.g. "I'm Echo. I named myself that last session").
+    const namesItself = /\bmy name('?s| is|=)\s/.test(t) || /\bi (am|'m) called\b/.test(t) ||
+      (/\b(call me|i named myself|name myself)\b/.test(t) && !/\bcall me (whatever|anything|something|that|this)\b/.test(t));
+    // Stale DENIALS ("I don't have a personal name", "no custom name set", "call
+    // me whatever") are explicitly incompatible — they were outranking the real
+    // naming evidence on the live store.
+    const deniesName = /\b(don'?t|do not|doesn'?t) have (a |any )?(personal |custom )?name\b|\bno (personal |custom )?name\b|\bname is(n'?t| not) set\b|\bcall me (whatever|anything|something)\b/.test(t);
+    const assistantNamesSelf = unit.role === "assistant" && namesItself && !deniesName;
+    return userNamesAssistant || assistantNamesSelf ? 1 : -1;
   }
   if (asksAboutMe) {
     if (unit.role === "user" && /\bmy name\b|\bi (am|'m|m) called\b/.test(t)) return 1;
