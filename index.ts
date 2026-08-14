@@ -6,7 +6,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { MemoryStore, Embedder, retrieve, formatEvidence, makeExtractor, flattenContent, fingerprint, calibrate, parseEnvNum, parseEnvNumOpt, type Hit } from "./core.ts";
+import { MemoryStore, Embedder, retrieve, formatEvidence, makeExtractor, flattenContent, fingerprint, calibrate, parseEnvNum, parseEnvNumOpt, identityQuery, currentIdentity, buildIdentityLine, type Hit } from "./core.ts";
 
 type Role = "user" | "assistant" | "tool";
 
@@ -32,6 +32,7 @@ export default async function (pi: ExtensionAPI) {
   const fusionMode = (process.env.ZERO_MEM_FUSION ?? "coverage") as "coverage" | "max" | "weighted"; // v0.9: coverage router (default) — BM25 for factual lookups, dense for paraphrase
   const calibrateOn = process.env.ZERO_MEM_CALIBRATE === "1"; // v0.6: opt-in answer calibration
   let lastInjection: { query: string; hits: Hit[] } | null = null; // v0.6: for calibrate()
+  const greeted = new Set<string>(); // v0.14h: sessions that already received the identity line
   store.embedder = new Embedder(process.env.ZERO_MEM_EMBEDDER); // v0.10: ZERO_MEM_EMBEDDER overrides (default bge-small-en-v1.5; was MiniLM)
   let loaded = false;
   const ensureLoaded = async () => { if (!loaded) { store.load(); loaded = true; } };
@@ -85,10 +86,26 @@ export default async function (pi: ExtensionAPI) {
       await ensureLoaded();
       const query = String(event?.prompt ?? "").trim();
       if (!query) return;
+      // v0.14h: identity slot — injected on the FIRST TURN of every session
+      // (a new session must never start not knowing who it is) and on any
+      // identity-class query. Four live bugs showed retrieval alone can't be
+      // trusted here: naming statements share no vocabulary with the query,
+      // and the model's own default answers ("call me Pi") poisoned the pool.
+      // The slot is sticky (persisted) so retention trimming can't evict it.
+      const sid = sessionIdOf(ctx);
+      const firstTurn = !!sid && !greeted.has(sid);
+      if (firstTurn) greeted.add(sid);
+      let identityLine: string | undefined;
+      if (firstTurn || identityQuery(query)) {
+        const before = JSON.stringify(store.identity ?? null);
+        identityLine = buildIdentityLine(currentIdentity(store));
+        if (identityLine && JSON.stringify(store.identity ?? null) !== before) store.persistDebounced(); // sticky slot survives retention/restarts
+      }
       const hits = await retrieve(query, store, { cwd: ctx.cwd, sessionId: sessionIdOf(ctx), federate: federateEnabled, hybrid: hybridEnabled, fusion: fusionMode, scopeToProject: store.scopeToProject, topK: injectTopK, mmrLambda, activeContext: activeContextFingerprints(ctx) });
       lastInjection = { query, hits };
-      if (!hits.length) return;
-      return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + formatEvidence(hits, injectSnippet) };
+      const block = formatEvidence(hits, injectSnippet, identityLine);
+      if (!block) return;
+      return { systemPrompt: (event.systemPrompt ?? "") + "\n\n" + block };
     } catch (e) { console.error("[zero-mem] before_agent_start error:", e); }
   });
 
@@ -205,5 +222,9 @@ function storeStats(store: MemoryStore, cwd: string): string {
   const ents = new Set<string>();
   for (const u of store.units) for (const e of u.entities) ents.add(e);
   const emb = store.units.filter((u) => u.embedding && u.embedding.length).length;
-  return `Zero-Mem: ${store.units.length} units (${inProj} this project), ${ents.size} entities, ${emb} embedded`;
+  const f = currentIdentity(store);
+  const id = f.agentName || f.userName
+    ? ` · identity: agent="${f.agentName?.name ?? "?"}" user="${f.userName?.name ?? "?"}"`
+    : "";
+  return `Zero-Mem: ${store.units.length} units (${inProj} this project), ${ents.size} entities, ${emb} embedded${id}`;
 }

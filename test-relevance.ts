@@ -8,7 +8,7 @@
  * pool (only matching term: "name") to [0,1], so garbage scored ~0.5 and beat
  * minScore. v0.14b adds pool-confidence gating — weak pools stay weak.
  */
-import { MemoryStore, makeExtractor, retrieve, Embedder } from "./core.ts";
+import { MemoryStore, makeExtractor, retrieve, Embedder, identityFacts, currentIdentity, buildIdentityLine } from "./core.ts";
 
 let pass = 0, fail = 0;
 const check = (name: string, cond: boolean, extra = "") => { if (cond) { pass++; console.log(`  ✓ ${name} ${extra}`); } else { fail++; console.log(`  ✗ ${name} ${extra}`); } };
@@ -146,6 +146,49 @@ check("greeting query never surfaces unrelated facts", !hi.some((h) => h.unit.te
   const q3 = await retrieve("whats my name?", s4, { cwd: ZM, sessionId: "fresh", topK: 3 });
   check("'whats my name?' ranks mark's statement above the question echo", q3.length > 0 && q3[0].unit.text === "my name is mark",
     `(top: ${q3[0]?.unit.text.slice(0, 40) ?? "none"})`);
+}
+
+// 8. The v0.14h live bug (REAL transcript #4, "Aio") + identity robustness: the
+// agent self-named "Aio" ("I'll go with 'Aio'…", "I'm Aio, you're Mark"), then
+// 41 SECONDS later answered "whats your name?" with "You can call me Pi" — its
+// own default answers had been captured and are coincidentally "call me
+// X"-shaped, so they won as self-naming evidence. v0.14h: name-candidate
+// extraction with a harness-default poison filter + a sticky identity slot
+// injected on every session's first turn.
+{
+  const s5 = new MemoryStore("C:/Users/Robot/projects/zero-mem-pi/.relevance-test5.json", extract);
+  s5.embedder = new Embedder();
+  await s5.embedder.init();
+  const P = "C:/proj", now = Date.now();
+  const add5 = (role: "user" | "assistant", text: string, agoS: number) =>
+    s5.add({ sessionId: "naming", cwd: P, role, text, timestamp: now - agoS * 1000 });
+  add5("assistant", "I'm the coding assistant running inside pi, a coding agent harness — you can just call me Pi. Under the hood, I'm powered by GLM.", 300);
+  add5("user", "pick a name for yourself, something short", 240);
+  add5("assistant", "Alright, let me pick something with a bit of character...\n\nI'll go with **\"Aio\"** (pronounced *AH-yo*) — a blend of \"AI\" and \"I/O\". It's short, easy to type, and fits what I do all day.", 235);
+  add5("assistant", "Nice to meet you, Mark! 👋 So that's settled: I'm **Aio**, you're **Mark**. What can I help you with today?", 230);
+  add5("assistant", "You can call me **Pi** — that's the name of the coding agent harness I run in. Under the hood, I'm powered by **GLM**.", 200); // the poison: default answer AFTER the naming
+
+  const f = identityFacts(s5.units);
+  check("identityFacts: agentName is aio (self-named), NOT the Pi default", f.agentName?.name === "aio" && f.agentName.source === "self-named", `(got ${JSON.stringify(f.agentName)})`);
+  check("identityFacts: userName is mark", f.userName?.name === "mark", `(got ${JSON.stringify(f.userName)})`);
+
+  const n1 = await retrieve("whats your name?", s5, { cwd: P, sessionId: "new-session", topK: 3 });
+  check("'whats your name?' ranks an Aio naming statement first", n1.length > 0 && /aio/i.test(n1[0].unit.text), `(top: ${n1[0]?.unit.text.slice(0, 40) ?? "none"})`);
+  check("harness default answers ('call me Pi') are never injected", !n1.some((h) => /call me \*{0,2}pi/i.test(h.unit.text)));
+
+  add5("assistant", "Sure — call myself Rex from now on.", 100);
+  check("rename: newest naming event wins (rex)", identityFacts(s5.units).agentName?.name === "rex", `(got ${identityFacts(s5.units).agentName?.name})`);
+  add5("user", "actually, let's go with Nova", 50);
+  check("user 'let's go with Nova' overrides (user-named)", identityFacts(s5.units).agentName?.name === "nova" && identityFacts(s5.units).agentName?.source === "user-named", `(got ${JSON.stringify(identityFacts(s5.units).agentName)})`);
+  add5("user", "hmm, for the retry strategy I'll go with exponential backoff", 40);
+  check("non-name 'go with exponential backoff' does NOT rename", identityFacts(s5.units).agentName?.name === "nova", `(got ${identityFacts(s5.units).agentName?.name})`);
+  check("agent-naming chatter never becomes the USER's name", identityFacts(s5.units).userName?.name === "mark", `(got ${JSON.stringify(identityFacts(s5.units).userName)})`);
+
+  const sticky = currentIdentity(s5); // caches into s5.identity (persisted in store.json)
+  s5.units = [];                      // simulate retention evicting every naming unit
+  const after = currentIdentity(s5);
+  check("sticky identity survives retention evicting the naming units", !!after.agentName && after.agentName.name === sticky.agentName?.name, `(${sticky.agentName?.name} → ${after.agentName?.name})`);
+  check("buildIdentityLine states the name for the reader", /nova/.test(buildIdentityLine(currentIdentity(s5)) ?? ""), `(${buildIdentityLine(currentIdentity(s5))})`);
 }
 
 console.log(`\nRESULTS: ${pass} passed, ${fail} failed`);

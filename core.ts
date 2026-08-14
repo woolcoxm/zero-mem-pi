@@ -543,6 +543,7 @@ export class MemoryStore {
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private counter = 0;
   scopeToProject = true;
+  identity?: IdentityFacts;        // v0.14h: sticky identity slot (persists in store.json; survives retention)
   maxUnits = 2000;                  // v0.5: retention safety net (ZERO_MEM_MAX_UNITS)
   maxAgeMs = 90 * 24 * 3600 * 1000; // v0.5: ~90d (ZERO_MEM_MAX_AGE_DAYS)
   graph = new EntityGraph();
@@ -572,6 +573,7 @@ export class MemoryStore {
         for (const u of this.units) if (!u.tokens || !u.tokens.length) u.tokens = tokenize(u.text); // v0.7: tokens not persisted; recompute from text
         this.scopeToProject = raw?.scopeToProject ?? true;
         this.counter = raw?.counter ?? this.units.length;
+        if (raw?.identity?.agentName || raw?.identity?.userName) this.identity = raw.identity; // v0.14h sticky slot
       }
       // v0.5: fill embeddings from the int8 sidecar. If the sidecar is absent
       // (legacy store, pre-migration) units keep their inline arrays in memory;
@@ -787,7 +789,7 @@ export class MemoryStore {
       // v0.13: write temp + rename so a crash mid-write can never corrupt the store.
       const stubs = this.units.map((u) => { const { tokens, embedding, ...rest } = u; return rest; });
       const tmpJson = this.path + ".tmp";
-      writeFileSync(tmpJson, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter, embedder: this.embedder?.model }));
+      writeFileSync(tmpJson, JSON.stringify({ units: stubs, scopeToProject: this.scopeToProject, counter: this.counter, embedder: this.embedder?.model, identity: this.identity }));
       renameSync(tmpJson, this.path);
       this.writeEmbeddings(this.units);
       try { this.loadedMtimeMs = statSync(this.path).mtimeMs; } catch { /* ignore */ }
@@ -854,6 +856,126 @@ export function evidenceCompat(query: string, text: string): number {
   return 0; // no detectable expected type → neutral
 }
 
+// ── v0.14h: naming-statement detection + identity slots ─────────────────────
+// Four live bugs (Echo, Cipher ×2, Aio) all had the same shape: a naming
+// statement whose phrasing wasn't recognized ("call me X" worked; "go by X",
+// "go with X", "I'm X" didn't), losing to the harness's OWN default answers
+// ("you can just call me Pi") which are coincidentally "call me X"-shaped and
+// got boosted as self-naming evidence — the system injecting its own amnesia.
+// Fix: match a broad set of naming phrases, EXTRACT the name candidate that
+// follows, and reject/marker harness-default candidates (pi, glm, …).
+const DEFAULT_AGENT_NAMES = new Set(["pi", "glm", "z.ai", "zai", "gpt", "chatgpt", "claude", "gemini", "copilot", "codex", "llama", "qwen", "assistant", "bot", "agent", "model", "ai"]);
+const NON_NAME_WORDS = new Set(["a", "an", "the", "so", "not", "just", "still", "sorry", "sure", "back", "done", "here", "glad", "happy", "also", "now", "all", "your", "my", "me", "it", "this", "that", "going", "running", "working", "using", "looking", "showing", "picking", "trying", "doing", "feeling", "very", "really", "powered", "trained", "inside", "always", "going", "sure", "curious", "plan", "option", "options", "second", "first", "third", "fourth", "version", "approach", "idea", "ideas", "suggestion", "suggestions", "recommendation", "default", "latest", "other", "another", "new", "old", "same", "one", "two", "three", "change", "fix", "update", "branch", "main", "master", "whatever", "anything", "something"]);
+
+export interface NamingMatch { pos: number; name: string; defaultName: boolean; }
+/** Find the first naming phrase in `text` with a plausible NAME after it.
+ *  Phrases: "my name is X", "I'm called X", "call me X", "I named myself X",
+ *  "go/goes by X", "go/went with X", "answer to X", "that's me! X", "I'm/I am X".
+ *  Returns null when no phrase carries a real name ("I'm going to…", "call me
+ *  back"). defaultName=true marks harness-default self-answers ("call me Pi"). */
+export function namingMatch(text: string): NamingMatch | null {
+  // 'i' flag matters: "I'm Echo" has a capital I — without it the live Echo
+  // unit fell through to "I named myself THAT" and the candidate was rejected.
+  const re = /\b(?:my name(?:'s| is|=)|i am called|i'?m called|call me|call myself|named myself|name myself|go by|goes by|go with|went with|answer to|known as|that'?s me|i'?m|i am)\b\s*["'“‘’*]*\s*([A-Za-z][A-Za-z0-9-]{1,15})?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const cand = (m[1] ?? "").toLowerCase().replace(/\.+$/, "");
+    if (!cand || NON_NAME_WORDS.has(cand)) continue; // phrase without a real name
+    return { pos: m.index, name: cand, defaultName: DEFAULT_AGENT_NAMES.has(cand) };
+  }
+  return null;
+}
+
+export interface IdentityFact { name: string; ts: number; source: string; }
+export interface IdentityFacts { agentName?: IdentityFact; userName?: IdentityFact; }
+// User SELF-introduction ("my name is mark", "call me mark", "I'm Mark") —
+// deliberately narrower than namingMatch: "let's go with Nova" names the AGENT,
+// not the user, and bare lowercase "i'm confused" is not a self-intro. The bare
+// "I'm X" form requires a proper-noun candidate (starts uppercase in the
+// ORIGINAL text — checked in code, since regex `i` flags fold [A-Z]).
+function userSelfIntroName(text: string): string | null {
+  const m = text.match(/\b(?:my name(?:'s| is|=)|i am called|i'?m called|call me)\b\s*["'“‘’*]*\s*([A-Za-z][A-Za-z0-9-]{1,15})/i);
+  if (m?.[1]) return m[1].toLowerCase();
+  const m2 = text.match(/\bi'?m\s+["'“‘’*]*\s*([A-Za-z][A-Za-z0-9-]{1,15})/i);
+  const c = m2?.[1] ?? "";
+  if (c && c[0] === c[0].toUpperCase() && c[0] !== c[0].toLowerCase()) return c.toLowerCase();
+  return null;
+}
+// "go with X" from the user only counts when X is QUOTED or a proper noun —
+// names are capitalized or quoted, and "let's go with exponential backoff"
+// must never rename the agent. Quote/proper-noun discrimination in code (an
+// `i` regex flag would fold the [A-Z] class).
+function userGoWithName(text: string): string | null {
+  const mq = text.match(/\b(?:let'?s |we'?ll |i'?ll |should |can )?(?:go|going|went) with\s*["'“‘’*]+\s*([A-Za-z][A-Za-z0-9-]{1,15})/i);
+  if (mq?.[1]) return mq[1].toLowerCase();
+  const mb = text.match(/\b(?:let'?s |we'?ll |i'?ll |should |can )?(?:go|going|went) with\s+([A-Za-z][A-Za-z0-9-]{1,15})/i);
+  const c = mb?.[1] ?? "";
+  if (c && c[0] === c[0].toUpperCase() && c[0] !== c[0].toLowerCase()) return c.toLowerCase();
+  return null;
+}
+/** v0.14h: deterministic identity slots — the agent's and user's names, derived
+ *  from the raw store (latest confident naming event wins, newest unit first;
+ *  harness-default candidates are skipped so the model's own "call me Pi"
+ *  answers can never win). Identity queries share no vocabulary with naming
+ *  statements, so retrieval alone kept missing them; the slot is injected
+ *  directly for identity queries, immune to pool confidence / min-max /
+ *  federation margins / recency exclusion. Zero-LLM, recomputed per query. */
+export function identityFacts(units: { role: Role; text: string; timestamp: number }[]): IdentityFacts {
+  const facts: IdentityFacts = {};
+  const userDirected = /\byour name(?:'s| is|=)\s*["'“‘’*]*([A-Za-z][A-Za-z0-9-]{1,15})|\b(?:call|name|naming) you\s*["'“‘’*]*([A-Za-z][A-Za-z0-9-]{1,15})|\byou (?:should |will )?(?:go|goes|going) by\s*["'“‘’*]*([A-Za-z][A-Za-z0-9-]{1,15})|\b(?:name|call) yourself\s*["'“‘’*]*([A-Za-z][A-Za-z0-9-]{1,15})/i;
+  const ok = (c: string) => !!c && !NON_NAME_WORDS.has(c) && !DEFAULT_AGENT_NAMES.has(c);
+  const sorted = [...units].sort((a, b) => b.timestamp - a.timestamp);
+  for (const u of sorted) {
+    if (!facts.agentName && u.role === "user") {
+      const m = u.text.match(userDirected);
+      const cand = (m?.[1] ?? m?.[2] ?? m?.[3] ?? m?.[4] ?? userGoWithName(u.text) ?? "").toLowerCase();
+      if (ok(cand)) facts.agentName = { name: cand, ts: u.timestamp, source: "user-named" };
+    }
+    if (!facts.agentName && u.role === "assistant") {
+      const nm = namingMatch(u.text);
+      if (nm && !nm.defaultName) facts.agentName = { name: nm.name, ts: u.timestamp, source: "self-named" };
+    }
+    if (!facts.userName && u.role === "user") {
+      const cand = userSelfIntroName(u.text) ?? "";
+      if (ok(cand)) facts.userName = { name: cand, ts: u.timestamp, source: "user-stated" };
+    }
+    if (!facts.userName && u.role === "assistant") {
+      // explicit "your name is X" always counts; bare "you're X" only when X is
+      // a proper noun ("You're absolutely right" is not a naming)
+      const m2 = u.text.match(/\byour name is\s*["'“‘’*]*([A-Za-z][A-Za-z0-9-]{1,15})/i);
+      const m1 = u.text.match(/\byou'?re\s*["'“‘’*]*([A-Za-z][A-Za-z0-9-]{1,15})/i);
+      const c1 = m1?.[1] ?? "";
+      const cand = (m2?.[1] ?? "").toLowerCase() ||
+        (c1 && c1[0] === c1[0].toUpperCase() && c1[0] !== c1[0].toLowerCase() ? c1.toLowerCase() : "");
+      if (ok(cand)) facts.userName = { name: cand, ts: u.timestamp, source: "observed" };
+    }
+    if (facts.agentName && facts.userName) break;
+  }
+  return facts;
+}
+
+/** v0.14h: sticky identity — compute fresh facts, fall back to the persisted
+ *  cache when the naming units were evicted by retention (a 90-day-old naming
+ *  event is still the agent's name — retention must not cause amnesia), and
+ *  refresh the cache so the newest naming event wins across restarts. */
+export function currentIdentity(store: { units: TraceUnit[]; identity?: IdentityFacts }): IdentityFacts {
+  const fresh = identityFacts(store.units);
+  const out: IdentityFacts = {};
+  if (fresh.agentName ?? store.identity?.agentName) out.agentName = fresh.agentName ?? store.identity?.agentName!;
+  if (fresh.userName ?? store.identity?.userName) out.userName = fresh.userName ?? store.identity?.userName!;
+  if (out.agentName || out.userName) store.identity = out;
+  return out;
+}
+
+/** v0.14h: the identity line injected at the top of the memory block (first
+ *  turn of every session, and any identity-class query). */
+export function buildIdentityLine(f: IdentityFacts): string | undefined {
+  const parts: string[] = [];
+  if (f.agentName) parts.push(`the assistant's name is "${f.agentName.name}" (${f.agentName.source} ${relTime(f.agentName.ts)}) — use this name when asked`);
+  if (f.userName) parts.push(`the user's name is "${f.userName.name}"`);
+  return parts.length ? `- Identity: ${parts.join("; ")}` : undefined;
+}
+
 /** v0.14b: FIRST-PERSON/SECOND-PERSON perspective compatibility (Eq 15 spirit).
  *  Motivated by a live failure: "what is your name?" (asking the ASSISTANT) pulled
  *  in "my name is mark." + "your name is Henry." and the reader hallucinated a
@@ -878,40 +1000,36 @@ export function perspectiveCompat(query: string, unit: { role: Role; text: strin
   const asksAboutYou = /\byour name\b|\byou name\b|\bur name\b|\byou (are|'re|re) called\b|\bwhat should i call you\b/.test(q);
   const asksAboutMe = /\bmy name\b|\bwho am i\b|\bwhat did i say\b|\bi (am|'m|m) called\b/.test(q);
   if (asksAboutYou && !asksAboutMe) {
-    // (a) the user ASSIGNS the assistant a name ("your name is X" — including the
-    // "name's" contraction — "I'll call you X", "I named you X", "you should go
-    // by X"). Asking isn't evidence. v0.14g: "go by" phrasing — the live Cipher
-    // transcript's naming evidence ("you asked me to go by Cipher") matched none
-    // of the earlier patterns.
+    // (a) the user ASSIGNS the assistant a name ("your name is X", "I'll call
+    // you X", "you should go by X"). Asking isn't evidence.
     const userNamesAssistant = unit.role === "user" &&
       /\byour name('?s| is|=)\b|\byou (are|'re|re|will be|'ll be) called\b|\b(i'?ll| will| can| should)?\s?(call|name|named|naming) you\b|\b(go|goes|going) by\b/.test(t);
-    // (b) the assistant names ITSELF ("my name is X", "I'm called X", "call me X",
-    // "I go by X", "I named myself X" — even when the name itself appears elsewhere
-    // in the unit, e.g. "I'm Echo. I named myself that last session").
-    const namesItself = /\bmy name('?s| is|=)\s/.test(t) || /\bi (am|'m) called\b/.test(t) ||
-      (/\b(call me|i named myself|name myself|go by|goes by)\b/.test(t) && !/\bcall me (whatever|anything|something|that|this)\b/.test(t));
-    // Stale DENIALS ("I don't have a personal name", "no custom name set", "call
-    // me whatever") are explicitly incompatible — they were outranking the real
-    // naming evidence on the live store.
+    if (userNamesAssistant) return 1;
+    // (b) the assistant names ITSELF — any recognized phrasing with a real
+    // name candidate (v0.14h: namingMatch). The harness's OWN default answers
+    // ("you can just call me Pi") are "call me X"-shaped and used to win as
+    // self-naming evidence — the system injecting its own amnesia. A
+    // default-named self-statement is now POISON (suppressed like a denial).
     const deniesName = /\b(don'?t|do not|doesn'?t) have (a |any )?(personal |custom )?name\b|\bno (personal |custom )?name\b|\bname is(n'?t| not) set\b|\bcall me (whatever|anything|something)\b/.test(t);
-    const assistantNamesSelf = unit.role === "assistant" && namesItself && !deniesName;
-    if (userNamesAssistant || assistantNamesSelf) {
-      // v0.14g: name CENTRALITY. A unit that QUOTES a naming statement verbatim
-      // (live case: an "E2E test complete" summary embedding the injected
-      // snippet) matches the same patterns but buries the name 380+ chars in —
-      // past the 120-char injected snippet, where the reader never sees it — and
-      // outranked the original on the live store. Grade the boost by how EARLY
-      // the naming phrase appears: source statements beat quotations.
-      const pos = t.search(/\bmy name('?s| is|=)\s|\bi (am|'m) called\b|\bcall me\b|\bi named myself\b|\bname myself\b|\b(go|goes|going) by\b|\byour name('?s| is|=)\b|\byou (are|'re|re|will be|'ll be) called\b|\b(call|name|named|naming) you\b/);
-      return pos < 0 ? 1 : Math.max(0.2, 1 - pos / 600);
+    if (unit.role === "assistant") {
+      const nm = namingMatch(unit.text);
+      if (nm && !deniesName) {
+        if (nm.defaultName) return -0.5; // harness default ("call me Pi") — misleads the reader
+        // v0.14g name CENTRALITY: a unit that QUOTES a naming statement (the
+        // "E2E test" summary) buries the name past the 120-char snippet. Grade
+        // the boost by how EARLY the naming phrase appears: source beats quote.
+        return Math.max(0.2, 1 - nm.pos / 600);
+      }
     }
     return -1;
   }
   if (asksAboutMe) {
-    // v0.14g: evidence must be a naming STATEMENT ("my name is X", "I'm called
-    // X") — the old /\bmy name\b/ pattern gave +1 to the user's QUESTION units
-    // ("whats my name?"), which then outranked the actual statement.
-    if (unit.role === "user" && /\bmy name('?s| is|=)\s|\bi (am|'m|m) called\b/.test(t)) return 1;
+    // v0.14g/h: evidence must be a naming STATEMENT with a real candidate —
+    // the user's QUESTION units ("whats my name?") stopped counting.
+    if (unit.role === "user") {
+      if (/\bmy name('?s| is|=)\s/.test(t) || /\bi (am|'m|m) called\b/.test(t)) return 1;
+      if (userSelfIntroName(unit.text)) return 1; // "call me mark" / "I'm Mark" self-intros
+    }
     if (/\byour name\b|\byou (are|'re|re) called\b/.test(t)) return -0.5; // assistant's restatement of the user's name — echo, not source
   }
   return 0; // no perspective signal → neutral
@@ -924,8 +1042,9 @@ export function perspectiveCompat(query: string, unit: { role: Role; text: strin
  *  "name" fields in-project and the real "my name is mark" unit never surfaced. */
 export function identityQuery(query: string): boolean {
   const q = query.toLowerCase();
-  // v0.14g: "you name"/"ur name" typo variants (live query "whats you name?").
-  return /\bmy name\b|\byour name\b|\byou name\b|\bur name\b|\bwho am i\b|\bwho are you\b|\bwhat should i call you\b|\bwhat did i say\b|\byou (are|'re|re) called\b|\bi (am|'m|m) called\b/.test(q);
+  // v0.14g/h: typo variants + the wider family of identity questions — the
+  // slot must fire for every phrasing a user actually types.
+  return /\bmy name\b|\byour name\b|\byou name\b|\bur name\b|\bwho am i\b|\bwho are you\b|\bwhat should i call you\b|\bwhat did i say\b|\byou (are|'re|re) called\b|\bi (am|'m|m) called\b|\bdo you remember me\b|\bdo you know (me|who i am|who)\b|\bwhat are you called\b|\bwho am i talking to\b|\bintroduce yourself\b|\bremember my name\b|\bwhat'?s (the|your) assistant'?s name\b/.test(q);
 }
 
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
@@ -1283,11 +1402,12 @@ export function sanitizeSnippet(text: string, snippetChars: number): string {
   return s;
 }
 
-export function formatEvidence(hits: Hit[], snippetChars = 220): string {
-  if (!hits.length) return "";
+export function formatEvidence(hits: Hit[], snippetChars = 220, identityLine?: string): string {
+  if (!hits.length && !identityLine) return "";
   const lines = [
     "## Prior session memory (Zero-Mem — use only if relevant; not authoritative)",
   ];
+  if (identityLine) lines.push(identityLine); // v0.14h: derived identity slot, first line
   for (const h of hits) {
     const u = h.unit;
     const snip = sanitizeSnippet(u.text, snippetChars);

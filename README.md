@@ -42,8 +42,9 @@ For permanent auto-load (hot-reloadable via `/reload`), copy/symlink the folder 
 - Every finalized message is captured as a **trace unit** with provenance (session, project, time) + extracted entities, then embedded with `bge-small-en-v1.5` (v0.10; was MiniLM).
 - On each prompt, a **zero-LLM pipeline** routes between two views — the entity–context graph scored by **Personalized PageRank** (v0.14, paper Eq 8–10) vs. the lexical/semantic view (hybrid BM25+dense over units plus session-adjacent turn closure — no recency prior; the paper's full temporal hierarchy is only partially realized) — fuses them (primary view gets ρ), runs evidence closure, and injects up to **3** snippets (default) as a `## Prior session memory` block in the system prompt.
 - Memory is **project-scoped** by default and persisted to `~/.pi/agent/zero-mem/`:
-  - `store.json` — text + metadata only (small, human-readable).
+  - `store.json` — text + metadata + the sticky identity slot (small, human-readable).
   - `store.emb.bin` — embeddings, **int8-quantized** in a compact sidecar (v0.5). The full-precision JSON era is gone; a one-shot `migrate.ts` converts legacy stores automatically on first load.
+- A derived **identity slot** (the agent's and the user's name) is injected on every session's first turn and on identity-class queries — a new session never starts not knowing who it is (v0.14h).
 - A **retention policy** bounds growth (drop units older than `maxAgeMs`; trim to `maxUnits`).
 - Above ~10k embedded units, retrieval switches from exact brute-force cosine to a **pure-JS HNSW** index (growth-gated rebuild, so it never stalls a turn).
 
@@ -285,6 +286,25 @@ Requires Node ≥ 22 (for `--experimental-strip-types`). The live MiniLM embedde
 loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB).
 
 ## Status
+
+**v0.14h** — fifth live bug ("Aio") + identity made robust. The agent
+self-named "Aio" and 41 seconds later answered "whats your name?" with "You can
+call me Pi": the naming statement ("I'll go with 'Aio'", "I'm Aio") shared no
+vocabulary with the query, matched no naming pattern — and worst, the harness's
+own default answers ("you can just call me Pi") are "call me X"-shaped and won
+as self-naming evidence: the system was injecting its own amnesia. Structural
+fix, beyond broader phrasings ("go with", "call myself", "known as", typo and
+question variants, user "let's go with X" with a proper-noun gate): **name-
+candidate extraction with a harness-default poison filter** ("call me Pi"
+suppresses instead of boosting), and a **sticky identity slot** — the agent's
+and user's names derived deterministically from the store (latest confident
+naming event wins; renames supported), persisted in `store.json` so retention
+can never evict them, and injected as the first line of the memory block on
+**every session's first turn** and any identity-class query — immune to pool
+confidence, min-max stretching, federation margins, and recency exclusion, the
+gauntlet that killed identity evidence four times. `/memory-stats` shows the
+slot. Verified end-to-end on the real store + 11 new regression checks
+(`test-relevance.ts` §8); 11 files / 96 assertions green.
 
 **v0.14g** — fourth live bug (the "Cipher" transcript): "whats you name?" /
 "whats your name?" in a new session answered "I'm Pi" although the naming
