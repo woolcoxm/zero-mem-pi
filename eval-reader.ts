@@ -13,8 +13,17 @@
  * retrieval hit-rate report (gold dia_id in top-K) so the script is always useful.
  *
  * CLI (env doesn't propagate through npx in this shell, so use args):
- *   npx tsx eval-reader.ts [endpoint] [embedder] [sampleN] [topK]
- *   defaults: http://127.0.0.1:8080/v1  Xenova/bge-small-en-v1.5  100  5
+ *   node --experimental-strip-types eval-reader.ts [endpoint] [embedder] [sampleN] [topK]
+ *   defaults: http://127.0.0.1:8080/v1  Xenova/bge-small-en-v1.5  100  10
+ *
+ * Ablations (env vars, run with plain `node` so they propagate; the QA sample is
+ * seeded at 42, so runs are PAIRED — deltas compare question-by-question):
+ *   BRIDGES=0  → PPR graph off (direct entity matches only)
+ *   CLOSURE=0  → evidence closure off (no adjacent-turn / shared-entity neighbors)
+ *   CALIB=0    → evidence calibration off (Eq 15 answer-type re-rank)
+ * Recipe (paper's open-weights reader, F1 57.57): llama-server -m
+ *   Qwen2.5-14B-Instruct-Q4_K_M.gguf -c 8192 --port 8080, then run four times —
+ *   default, BRIDGES=0, CLOSURE=0, CALIB=0 — and compare answer F1 deltas.
  */
 import { MemoryStore, Embedder, makeExtractor, retrieve, formatEvidence } from "./core.ts";
 import { readFileSync, rmSync } from "node:fs";
@@ -24,6 +33,16 @@ const EMB_MODEL = process.argv[3] ?? "Xenova/bge-small-en-v1.5";
 const SAMPLE_N = Number(process.argv[4] ?? 100);
 const TOPK = Number(process.argv[5] ?? 10); // v0.11: paper's best retrieval budget (ablation: top-10 > top-5); was 5
 const CACHE = "C:/Users/Robot/projects/zero-mem-pi/.locomo10.json";
+
+// Ablation switches (env): reader-F1 is the metric that can credit or retire the
+// structural views — the retrieval metric (gold-in-top-K) structurally can't
+// credit supporting evidence closure/graph add (README "Where the margin comes
+// from"). Paper's HotpotQA ablations: hierarchy-only −17.2 F1, closure off −4.2,
+// calibration off −1.9.
+const ABL: { useBridges?: boolean; useClosure?: boolean; calibrateEvidence?: boolean } = {};
+if (process.env.BRIDGES === "0") ABL.useBridges = false;
+if (process.env.CLOSURE === "0") ABL.useClosure = false;
+if (process.env.CALIB === "0") ABL.calibrateEvidence = false;
 
 // ── SQuAD-style scoring (deterministic) ─────────────────────────────────────
 const norm = (s: any) => String(s ?? "").toLowerCase().replace(/\b(a|an|the)\b/g, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
@@ -95,6 +114,7 @@ console.log(`[reader] embedder: ${embedder.model} (ready=${embedder.ready})`);
 const up = await endpointUp(ENDPOINT);
 const model = up ? await modelName(ENDPOINT) : "";
 console.log(`[reader] endpoint ${ENDPOINT} ${up ? `UP (model: ${model})` : "DOWN — running retrieval-only fallback"}`);
+console.log(`[reader] ablation: graph=${ABL.useBridges === false ? "OFF" : "on"} closure=${ABL.useClosure === false ? "OFF" : "on"} calib=${ABL.calibrateEvidence === false ? "OFF" : "on"}`);
 console.log(`[reader] ${sampled.length} QA sampled (seeded random, seed=42), topK=${TOPK}\n` +
   `[reader] NOTE: F1/EM/BLEU below are on a 0–1 scale. The LoCoMo/Zero-Mem papers report ×100 —\n` +
   `[reader] multiply by 100 before comparing (and note: local reader ≠ GPT-4o-mini, strict RAG prompt,\n` +
@@ -112,7 +132,7 @@ const acc = { f1: 0, em: 0, bleu: 0, hit: 0, n: 0 } as Acc;
 const byCat = new Map<number, Acc>();
 const cat = (c: number) => { if (!byCat.has(c)) byCat.set(c, { f1: 0, em: 0, bleu: 0, hit: 0, n: 0 }); return byCat.get(c)!; };
 
-const R = { cwd: "C:/locomo", sessionId: "reader", scopeToProject: false, topK: TOPK, minScore: 0, mmr: false, useHnsw: false, hybrid: true, fusion: "coverage" as const };
+const R = { cwd: "C:/locomo", sessionId: "reader", scopeToProject: false, topK: TOPK, minScore: 0, mmr: false, useHnsw: false, hybrid: true, fusion: "coverage" as const, ...ABL };
 for (let s = 0; s < sampled.length; s++) {
   const { ci, q } = sampled[s];
     const { store, dia, dateOf } = await getStore(ci);
