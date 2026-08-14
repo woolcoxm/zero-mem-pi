@@ -40,7 +40,7 @@ For permanent auto-load (hot-reloadable via `/reload`), copy/symlink the folder 
 ## How it works (in pi)
 
 - Every finalized message is captured as a **trace unit** with provenance (session, project, time) + extracted entities, then embedded with `bge-small-en-v1.5` (v0.10; was MiniLM).
-- On each prompt, a **zero-LLM pipeline** routes between two views — the entity–context graph scored by **Personalized PageRank** (v0.14, paper Eq 8–10) vs. the semantic/temporal view — fuses them (primary view gets ρ), runs evidence closure, and injects up to **3** snippets (default) as a `## Prior session memory` block in the system prompt.
+- On each prompt, a **zero-LLM pipeline** routes between two views — the entity–context graph scored by **Personalized PageRank** (v0.14, paper Eq 8–10) vs. the lexical/semantic view (hybrid BM25+dense over units plus session-adjacent turn closure — no recency prior; the paper's full temporal hierarchy is only partially realized) — fuses them (primary view gets ρ), runs evidence closure, and injects up to **3** snippets (default) as a `## Prior session memory` block in the system prompt.
 - Memory is **project-scoped** by default and persisted to `~/.pi/agent/zero-mem/`:
   - `store.json` — text + metadata only (small, human-readable).
   - `store.emb.bin` — embeddings, **int8-quantized** in a compact sidecar (v0.5). The full-precision JSON era is gone; a one-shot `migrate.ts` converts legacy stores automatically on first load.
@@ -61,12 +61,17 @@ The only tokens spent on memory are the injected snippet (~103/turn).
 | Summarize / forget | no | **LLM calls** | deterministic retention policy |
 | Tokens spent on memory mgmt | retrieval tokens | **many** (LLM babysits its own memory) | **zero** — encoder math only |
 
-So vs. a bare vector store it's richer (co-occurrence graph bridges, temporal
-hierarchy, hybrid retrieval — not just cosine); vs. MemGPT-style systems it's far
+So vs. a bare vector store it's broader (entity-graph PPR + closure, session-aware
+scoping, hybrid retrieval — not just cosine); vs. MemGPT-style systems it's far
 cheaper (they burn LLM generations managing memory). The honest trade-off:
-retrieval quality is **competitive, not SOTA** — on real data it **ties BM25**
-(LoCoMo r@5 0.543 vs 0.529) and beats it on paraphrase (0.96 vs 0.75). The win
-is the zero-token property + the structured pipeline, not raw retrieval dominance.
+retrieval quality is **competitive, not SOTA** — on real data it **edges out
+BM25** (LoCoMo r@5 0.546 vs 0.535, +0.007 held-out) and beats it on paraphrase
+(0.96 vs 0.75), and that measurable win comes from the **coverage fusion**: the
+structural views are metric-neutral on retrieval benchmarks (closure off ⇒
+identical r@5; graph off ⇒ identical on the hard-negative eval) — the paper's
+evidence for them is reader-F1 on HotpotQA, which our reader-limited eval can't
+yet read. The win is the zero-token property + production memory behavior, not
+retrieval dominance.
 
 ## Commands
 
@@ -207,7 +212,16 @@ tuning decisions; 6–10 never did) shows the honest margin: CORE beats BM25 by
 i.e. the coverage fusion genuinely generalizes, with roughly half the headline
 gap attributable to tuned-on-test bias. Result: **0.546 (> BM25, significant)**
 on LoCoMo *and* **0.96 on the
-paraphrase eval** (vs BM25's 0.75) — best-of-both, no regressions. For the
+paraphrase eval** (vs BM25's 0.75) — best-of-both, no regressions.
+
+**Where the margin comes from:** the coverage fusion carries LoCoMo; the
+structural views are metric-neutral on this benchmark (closure off: 0.546/0.403
+above; graph off: identical on the hard-negative eval). Gold-in-top-K structurally
+can't credit the *supporting* evidence closure/graph add — neighbors can only
+displace gold. The paper's own view ablations are end-to-end reader F1 on
+HotpotQA (full 72.07; hierarchy-only 54.88; closure off −4.2); our reader eval is
+reader-limited (F1 0.200), so reader-F1 ablations are the open experiment that
+can credit or retire the views. For the
 paper's actual metric — end-to-end answer F1/EM/BLEU with an LLM reader —
 `eval-reader.ts` runs it: on a 50-QA LoCoMo sample (top-10 context + session
 dates, Qwen3-Coder reader, temp 0), **answer F1 0.200 / EM 0.040 / BLEU-1
@@ -265,7 +279,8 @@ graph, query reset vector seeded by direct matches + *embedding-cosine* entity
 matching, π ← (1−γ)r + γPᵀπ at γ=0.6) — replacing the count-based bridges — and
 **routing** now follows Eq 6–7/13 exactly (relational queries run graph-primary,
 temporal run hierarchy-primary; primary gets ρ=0.6). Validated on LoCoMo:
-r@5 **0.543 → 0.546**, McNemar p ≈ 0.0009 vs BM25, no regressions elsewhere.
+r@5 0.543 → 0.546 (+0.003, within noise — the significant p ≈ 0.0009 margin vs
+BM25 comes from the coverage fusion, not the graph), no regressions elsewhere.
 Evals got honest: held-out conversation split reported (tuned 1–5 vs untouched
 6–10), and a new 200-fact hard-negative paraphrase eval (`eval-hard.ts`) where
 every fact has a one-value-different sibling (FULL 0.695 vs true BM25 0.682 —
