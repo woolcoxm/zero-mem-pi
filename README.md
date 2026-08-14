@@ -232,6 +232,27 @@ comparable number. It's a strict RAG setup
 so it's a lower bound — the LoCoMo paper itself reports models "lag behind human
 performance." Embeddings are bit-exact deterministic across runs.
 
+**Reader-level ablations (v0.14e — Qwen2.5-14B-Instruct, the paper's open-weights
+reader; 100-QA seeded sample, paired runs, temp 0):**
+
+| config | answer F1 | EM | BLEU-1 | hit@10 |
+|---|---:|---:|---:|---:|
+| FULL | 0.098 | 0.050 | 0.095 | 0.600 |
+| − PPR graph (`BRIDGES=0`) | 0.099 | 0.050 | 0.096 | 0.600 |
+| − evidence closure (`CLOSURE=0`) | 0.090 | 0.050 | 0.087 | 0.590 |
+| − evidence calibration (`CALIB=0`) | **0.132** | **0.070** | **0.133** | 0.600 |
+
+Read: the **graph is neutral** at reader level too (matching retrieval-level
+neutrality); **closure is mildly positive** (+0.8 F1 pts — same direction as the
+paper's +4.2 on HotpotQA, smaller magnitude); and **evidence calibration as
+implemented is net-negative** (−3.4 pts): its surface date/number boost displaces
+better evidence on multi-session questions (cat2 F1 0.036 → 0.237 with it off).
+Calibration helped retrieval MRR (0.396 → 0.404 in v0.11) but hurts the reader —
+the two metrics disagree, which is exactly why this eval exists. Caveats: n=100,
+no significance test yet, and 24/100 adversarial questions score ~0 under strict
+RAG by construction (the earlier Qwen3-Coder 0.200 was a different, easier 50-QA
+sample). The paired deltas are the signal, not the absolutes.
+
 ## Tests
 
 ```bash
@@ -258,6 +279,13 @@ Requires Node ≥ 22 (for `--experimental-strip-types`). The live MiniLM embedde
 loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB).
 
 ## Status
+
+**v0.14e** — ran the reader-F1 ablation experiment (Qwen2.5-14B-Instruct, the
+paper's open-weights reader): **graph neutral, closure +0.8 F1 pts, evidence
+calibration −3.4 pts** (net-negative at reader level despite helping retrieval
+MRR — retrieval and reader metrics disagree). New ablation flags in
+`eval-reader.ts` (`BRIDGES=0` / `CLOSURE=0` / `CALIB=0`); table + read in the
+Eval section.
 
 **v0.14b/c** — live-bug fixes (three, each verified end-to-end on the real store):
 (1) weak retrieval pools (one matching term) were min-max-normalized into confident-looking
