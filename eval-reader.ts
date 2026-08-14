@@ -22,7 +22,7 @@ import { readFileSync, rmSync } from "node:fs";
 const ENDPOINT = process.argv[2] ?? "http://127.0.0.1:8080/v1";
 const EMB_MODEL = process.argv[3] ?? "Xenova/bge-small-en-v1.5";
 const SAMPLE_N = Number(process.argv[4] ?? 100);
-const TOPK = Number(process.argv[5] ?? 5);
+const TOPK = Number(process.argv[5] ?? 10); // v0.11: paper's best retrieval budget (ablation: top-10 > top-5); was 5
 const CACHE = "C:/Users/Robot/projects/zero-mem-pi/.locomo10.json";
 
 // ── SQuAD-style scoring (deterministic) ─────────────────────────────────────

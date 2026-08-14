@@ -65,11 +65,11 @@ const FENV = process.env.FUSION === "off" ? { hybrid: false }
   : { hybrid: true, fusion: "coverage" as const };
 const rankOf = (hits: any[], dia: Map<string, string>, gold: Set<string>) => { for (let i = 0; i < hits.length; i++) if (gold.has(dia.get(hits[i].unit.id) ?? "")) return i; return -1; };
 
-type Acc = { r1: number; r3: number; r5: number; mrr: number; n: number };
-const newAcc = (): Acc => ({ r1: 0, r3: 0, r5: 0, mrr: 0, n: 0 });
-const bump = (a: Acc, rank: number) => { a.n++; if (rank < 0) return; if (rank < 1) a.r1++; if (rank < 3) a.r3++; if (rank < 5) a.r5++; a.mrr += 1 / (rank + 1); };
+type Acc = { r1: number; r3: number; r5: number; r10: number; mrr: number; n: number };
+const newAcc = (): Acc => ({ r1: 0, r3: 0, r5: 0, r10: 0, mrr: 0, n: 0 });
+const bump = (a: Acc, rank: number) => { a.n++; if (rank < 0) return; if (rank < 1) a.r1++; if (rank < 3) a.r3++; if (rank < 5) a.r5++; if (rank < 10) a.r10++; a.mrr += 1 / (rank + 1); };
 const add = (A: Acc, b: Acc) => { A.r1 += b.r1; A.r3 += b.r3; A.r5 += b.r5; A.mrr += b.mrr; A.n += b.n; };
-const fmt = (a: Acc) => a.n ? `r@1 ${(a.r1 / a.n).toFixed(3)}  r@3 ${(a.r3 / a.n).toFixed(3)}  r@5 ${(a.r5 / a.n).toFixed(3)}  MRR ${(a.mrr / a.n).toFixed(3)}` : "(no qa)";
+const fmt = (a: Acc) => a.n ? `r@1 ${(a.r1 / a.n).toFixed(3)}  r@3 ${(a.r3 / a.n).toFixed(3)}  r@5 ${(a.r5 / a.n).toFixed(3)}  r@10 ${(a.r10 / a.n).toFixed(3)}  MRR ${(a.mrr / a.n).toFixed(3)}` : "(no qa)";
 
 const data = await loadDataset();
 const convs = (data as any[]);
