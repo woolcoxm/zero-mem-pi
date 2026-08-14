@@ -58,6 +58,7 @@ function buildStore(utts: { dia_id: string; text: string }[], embedder: Embedder
 }
 
 const R_OPTS = { cwd: "C:/locomo", sessionId: "eval-query", scopeToProject: false, topK: TOPN, minScore: 0, mmr: false, useHnsw: false } as const;
+const CALIB = process.argv[4] === "calib" ? { calibrateEvidence: true } : {};
 // CORE production fusion under test (env-tunable): default max; FUSION=off ⇒ v0.8 dense-only; FUSION=weighted [+SEM_W].
 const FENV = process.env.FUSION === "off" ? { hybrid: false }
   : process.env.FUSION === "weighted" ? { hybrid: true, fusion: "weighted" as const, semanticWeight: Number(process.env.SEM_W ?? 0.5) }
@@ -90,7 +91,7 @@ for (let ci = 0; ci < convs.length; ci++) {
     const sh = await retrieve(q.question, S.store, { ...R_OPTS, hybrid: false }); // PURE semantic (v0.8) baseline
     bump(bm, rankOf(bh, B.dia, gold));
     bump(sem, rankOf(sh, S.dia, gold));
-    const ch = await retrieve(q.question, S.store, { ...R_OPTS, ...FENV });
+    const ch = await retrieve(q.question, S.store, { ...R_OPTS, ...FENV, ...CALIB });
     bump(core, rankOf(ch, S.dia, gold));
     // RRF fusion over dia_id
     const rrf = new Map<string, number>();

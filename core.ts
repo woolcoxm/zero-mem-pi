@@ -35,6 +35,7 @@ export interface RetrieveOpts {
   rho?: number;
   activeContext?: Set<string>; // v0.3: fingerprints of messages already in the model's window (excluded)
   minScore?: number;           // v0.3: relevance floor (default 0.15) — drop weak/tangential hits
+  calibrateEvidence?: boolean; // v0.11: evidence calibration (paper Eq 15) — re-rank admissible evidence by answer-type compatibility (temporal→dates, quantity→numbers). Default ON (helps top-1/MRR, neutral elsewhere).
   useBridges?: boolean;        // v0.4: enable co-occurrence relational bridges (default true)
   useHnsw?: boolean;           // v0.6: HNSW ANN for semantic search at scale (default true; auto-gated by store.hnswThreshold)
   hnswEf?: number;             // v0.6: HNSW search ef (default 200 ~ recall 0.90 at dim 384; raise for more recall)
@@ -691,6 +692,19 @@ export function adaptiveMmrLambda(query: string, ents: string[], toks: string[])
   return Math.min(0.55, Math.max(0.4, 0.5 - density));  // neutral ~0.5, leans relevance with entities
 }
 
+// v0.11: evidence answer-type compatibility (paper Eq 15 "Rank by ... answer-type
+// compatibility"). Detects the expected answer form from the query and scores how well
+// a candidate's text matches it (temporal → dates; quantity → numbers). Used as a
+// small re-rank boost so type-compatible evidence wins near-ties.
+export function evidenceCompat(query: string, text: string): number {
+  const q = query.toLowerCase(), t = text.toLowerCase();
+  if (/\b(when|what (time|date|day)|how long ago|how old)\b/.test(q))
+    return /\b(\d{1,2}\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?|\d{4}|yesterday|today|tomorrow|last (week|month|year|night))\b/.test(t) ? 1 : 0;
+  if (/\b(how many|how much|number of|count|total)\b/.test(q))
+    return /\b\d+\b/.test(t) ? 1 : 0;
+  return 0; // no detectable expected type → neutral
+}
+
 export async function retrieve(query: string, store: MemoryStore, opts: RetrieveOpts): Promise<Hit[]> {
   store.ensureIndex();
 
@@ -899,6 +913,13 @@ export async function retrieve(query: string, store: MemoryStore, opts: Retrieve
     .filter((c) => c.score > minScore)
     .sort((a, b) => b.score - a.score)
     .filter((c) => { if (seenFp.has(c.unit.fp)) return false; seenFp.add(c.unit.fp); return true; }); // v0.3: de-dup near-identical evidence
+  // v0.11: evidence calibration (paper Eq 15) — re-rank admissible evidence by
+  // answer-type compatibility as a small boost (breaks near-ties toward type-matching
+  // evidence: temporal queries favor units containing dates, quantity → numbers).
+  if (opts.calibrateEvidence ?? true) {
+    const cw = 0.15;
+    ranked.sort((a, b) => (b.score + cw * evidenceCompat(query, b.unit.text)) - (a.score + cw * evidenceCompat(query, a.unit.text)));
+  }
   // v0.7: MMR diversifies the injected set so top-K isn't several near-duplicate
   // snippets. Diversify from a pool larger than topK, then select topK.
   const pool = ranked.slice(0, poolSize);
