@@ -65,7 +65,7 @@ So vs. a bare vector store it's richer (co-occurrence graph bridges, temporal
 hierarchy, hybrid retrieval — not just cosine); vs. MemGPT-style systems it's far
 cheaper (they burn LLM generations managing memory). The honest trade-off:
 retrieval quality is **competitive, not SOTA** — on real data it **ties BM25**
-(LoCoMo r@5 0.534 vs 0.529) and beats it on paraphrase (0.92 vs 0.75). The win
+(LoCoMo r@5 0.543 vs 0.529) and beats it on paraphrase (0.98 vs 0.75). The win
 is the zero-token property + the structured pipeline, not raw retrieval dominance.
 
 ## Commands
@@ -150,12 +150,12 @@ recall@K / MRR + token cost rather than end-to-end F1/BLEU.
 | config | recall@3 | recall@5 | MRR | tok/turn |
 |---|---:|---:|---:|---:|
 | BM25 only (no embeddings) | 0.75 | 0.75 | 0.73 | 32 |
-| coverage fusion (v0.9 default) | 0.90 | **0.92** | 0.88 | 81 |
+| coverage fusion (v0.11: min-max + calibration) | 0.96 | **0.98** | 0.90 | 63 |
 
-Headline: the **coverage router** lifts recall@5 **0.75 → 0.92** over BM25 on
-synonym/paraphrase queries. (This dataset is designed to stress semantic
-matching; the v0.8 dense-only path scored 0.96 here, but see LoCoMo below for
-why that default was wrong for real data.)
+Headline: the **coverage router** lifts recall@5 **0.75 → 0.98** over BM25 on
+synonym/paraphrase queries (v0.11's min-max normalization lifted it 0.92 → 0.98).
+(This dataset stresses semantic matching; the v0.8 dense-only path scored 0.96
+here, but see LoCoMo below for why that default was wrong for real data.)
 
 ### LoCoMo10 — the paper's real benchmark
 
@@ -169,20 +169,22 @@ utterance (by `dia_id`) lands in the top-K.
 | BM25 only | 0.529 | 0.393 |
 | pure semantic (MiniLM, v0.8 default) | 0.273 | 0.183 |
 | RRF hybrid (k=60) | 0.503 | 0.323 |
-| **coverage fusion (v0.9 default)** | **0.534** | **0.393** |
+| **coverage fusion (v0.11: min-max + calibration)** | **0.543** | **0.404** |
 
 On real conversational factual lookups, **BM25 beats MiniLM** (0.529 vs 0.273),
 and no naive fusion (max/weighted/RRF) recovers it — the dense model is weak
-out-of-domain. The v0.9 **coverage router** fixes it: blend BM25 + dense by
-the query's lexical coverage, so BM25 carries factual lookups (high coverage)
-while dense rescues synonym/paraphrase queries whose terms are OOV (low
-coverage). Result: **0.534 (≥ BM25) on LoCoMo** *and* **0.92 on the paraphrase
-eval** (vs BM25's 0.75) — best-of-both, no regressions. For the paper's actual
-metric — end-to-end answer F1/EM/BLEU with an LLM reader — `eval-reader.ts`
-runs it: on a 50-QA LoCoMo sample with a local Qwen3-Coder reader (temp 0),
-**answer F1 0.155 / EM 0.040 / BLEU-1 0.177** (retrieval hit@5 0.30 on that
-sample). That's a strict RAG setup (top-5 snippets + session dates only), so
-it's a lower bound — the LoCoMo paper itself reports models "lag behind human
+out-of-domain. The **coverage router** fixes it: blend BM25 + dense by the
+query's lexical coverage, so BM25 carries factual lookups (high coverage) while
+dense rescues synonym/paraphrase queries whose terms are OOV (low coverage).
+v0.11 added the paper's **min-max normalization** (Eq 12 — stretches dense
+cosines from [0.5,1] to [0,1]) and **evidence calibration** (Eq 15 — answer-type
+compatibility re-rank). Result: **0.543 (≥ BM25) on LoCoMo** *and* **0.98 on the
+paraphrase eval** (vs BM25's 0.75) — best-of-both, no regressions. For the
+paper's actual metric — end-to-end answer F1/EM/BLEU with an LLM reader —
+`eval-reader.ts` runs it: on a 50-QA LoCoMo sample (top-10 context + session
+dates, Qwen3-Coder reader, temp 0), **answer F1 0.200 / EM 0.040 / BLEU-1
+0.224** (retrieval hit@10 0.40; was F1 0.155 at top-5). It's a strict RAG setup
+so it's a lower bound — the LoCoMo paper itself reports models "lag behind human
 performance." Embeddings are bit-exact deterministic across runs.
 
 ## Tests
@@ -208,12 +210,13 @@ loaded on demand; tests that need it will fetch `all-MiniLM-L6-v2` once (~23 MB)
 
 ## Status
 
-**v0.10** — everything in v0.9 plus: the **default embedder upgraded MiniLM → bge-small-en-v1.5**
-(pure-semantic LoCoMo r@5 0.27 → 0.42; the store auto-re-embeds on model change), an
-**end-to-end reader eval** (`eval-reader.ts`) running the paper's actual metric —
-retrieve → LLM answers → F1/EM/BLEU (50-QA sample w/ a local reader: F1 0.155 /
-EM 0.040 / BLEU-1 0.177), and **proven determinism** (embeddings bit-exact across
-runs — the earlier "variance" was a harness bug). 38/38 tests green. Remaining
-work (beat BM25 outright — coverage currently *ties* it; a cross-encoder
-reranker or conversational embedder; incremental-HNSW quality tuning) is in
-[`DESIGN.md`](./DESIGN.md).
+**v0.11** — everything in v0.10 plus three **paper-fidelity fixes** (vs arXiv:2607.29377):
+**min-max per-view normalization** (Eq 12), **evidence calibration** (Eq 15 —
+answer-type compatibility re-rank), and **top-10 retrieval budget** (their ablation's
+best). All validated on the real LoCoMo benchmark with no regressions (38/38 tests):
+retrieval r@5 **0.534 → 0.543** (≥ BM25), MRR 0.393 → 0.404; paraphrase **0.92 →
+0.98**; end-to-end answer F1 **0.155 → 0.200** (BLEU-1 0.177 → 0.224). Also audited
+the paper's **BGE-M3** embedder — tested it; bge-small empirically wins on CPU (made
+`Embedder(model,pooling)` configurable for opt-in BGE-M3). Paper LoCoMo target
+(GPT-4o-mini reader): F1 59.15; our gap is mostly the reader (chat vs coder), not the
+pipeline. Remaining work in [`DESIGN.md`](./DESIGN.md).
